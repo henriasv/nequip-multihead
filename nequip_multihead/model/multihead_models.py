@@ -28,6 +28,7 @@ from nequip.model.utils import model_builder
 from nequip.model.energy_modules import _append_energy_modules
 
 from nequip_multihead.nn import MultiHeadReadout, PerHeadConvNetLayer
+from nequip_multihead._keys import HEAD_KEY
 
 from typing import Sequence, Optional, List, Dict, Union, Callable
 
@@ -312,4 +313,9 @@ def _FullMultiHeadNequIPGNNModel(
         type_names=type_names,
         pair_potential=pair_potential,
     )
-    return ForceStressOutput(energy_model, do_derivatives)
+    fso = ForceStressOutput(energy_model, do_derivatives)
+
+    # Add HEAD_KEY to the model's irreps_in so that GraphModel passes it
+    # through to the inner model (where MultiHeadReadout uses it).
+    fso.irreps_in[HEAD_KEY] = None
+    return fso
