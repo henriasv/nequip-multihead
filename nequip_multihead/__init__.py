@@ -10,4 +10,13 @@ register_fields(
     long_fields=[_keys.HEAD_KEY],
 )
 
+# Register libraries that need to be marked as external during packaging.
+# sympy is a transitive dependency that torch.package doesn't handle automatically.
+try:
+    from nequip.scripts._package_utils import register_libraries_as_external_for_packaging
+
+    register_libraries_as_external_for_packaging(extern_modules=["sympy"])
+except ImportError:
+    pass
+
 __all__ = ["__version__"]
