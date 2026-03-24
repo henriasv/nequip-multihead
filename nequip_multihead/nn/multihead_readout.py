@@ -3,6 +3,7 @@ import torch
 
 from nequip.data import AtomicDataDict
 from nequip.nn._graph_mixin import GraphModuleMixin
+from nequip.nn.model_modifier_utils import model_modifier
 from nequip.nn.atomwise import AtomwiseReduce, PerTypeScaleShift
 from nequip.nn.mlp import ScalarMLP
 
@@ -160,3 +161,29 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
             data.pop(f"_per_head_features_{head_name}", None)
 
         return data
+
+    @model_modifier(persistent=True, private=False)
+    @classmethod
+    def extract_head(cls, model, head_name: str):
+        """Extract a single head from a multi-head model for deployment.
+
+        Use via ``nequip-compile --modifiers extract_head head_name=dft``.
+        The returned model is a standard single-head model that does not
+        require HEAD_KEY in input data.
+        """
+        from nequip_multihead.model.extract_head import extract_head
+
+        return extract_head(model, head_name)
+
+    @model_modifier(persistent=True, private=False)
+    @classmethod
+    def extract_summed_heads(cls, model, head_names: str):
+        """Extract and sum multiple heads for delta-learning deployment.
+
+        Use via ``nequip-compile --modifiers extract_summed_heads head_names=dft+rpa``.
+        The ``head_names`` argument uses ``+`` as separator.
+        """
+        from nequip_multihead.model.extract_head import extract_summed_heads
+
+        names = head_names.split("+")
+        return extract_summed_heads(model, names)
