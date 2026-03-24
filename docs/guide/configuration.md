@@ -102,6 +102,14 @@ data:
 The `head_index` in `HeadStamper` must match the position in the `head_names` list. For `head_names: [baseline, delta]`, the baseline dataset uses `head_index: 0` and the delta dataset uses `head_index: 1`.
 ```
 
+### Sampling behavior
+
+With `ConcatDataset`, each frame is seen exactly once per epoch. Heads with more frames are sampled proportionally more often — there is no recycling of the smaller dataset. For example, with 1000 baseline frames and 100 delta frames, the model sees baseline data ~10x more often per epoch.
+
+This differs from NequIP's `CombinedLoader` with `max_size_cycle`, which recycles the smaller dataset to match the larger one. The natural weighting from `ConcatDataset` is generally appropriate — expensive-level data (often with more frames) gets proportional representation without artificial oversampling of the smaller dataset.
+
+If balanced sampling across heads is needed, use a custom `WeightedRandomSampler`.
+
 ## Loss
 
 Use `EnergyForceStressLoss` with `ignore_nan` for energy-only heads that have NaN force labels:
