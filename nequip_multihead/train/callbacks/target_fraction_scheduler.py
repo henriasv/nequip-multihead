@@ -235,13 +235,22 @@ class GradientNormFractionScheduler(Callback):
                 f"Cannot compute gradient norms."
             )
 
-            # Compute gradient norm for this loss component
-            grads = torch.autograd.grad(
-                tensor,
-                params,
-                retain_graph=True,
-                allow_unused=True,
-            )
+            # Compute gradient norm for this loss component.
+            # Temporarily disable donated_buffer optimization which is
+            # incompatible with retain_graph=True under torch.compile.
+            import torch._functorch.config as functorch_config
+
+            old_donated = functorch_config.donated_buffer
+            functorch_config.donated_buffer = False
+            try:
+                grads = torch.autograd.grad(
+                    tensor,
+                    params,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+            finally:
+                functorch_config.donated_buffer = old_donated
             # Compute total gradient norm across all parameters
             gnorm_sq = 0.0
             for g in grads:
