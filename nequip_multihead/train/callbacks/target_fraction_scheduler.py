@@ -223,40 +223,39 @@ class GradientNormFractionScheduler(Callback):
             "support in MetricsManager. Update your nequip installation."
         )
 
-        gnorms = {}
-        for metric_name in self.target_fractions:
-            tensor = loss_manager.metrics_tensors_step.get(metric_name)
-            assert tensor is not None and isinstance(tensor, torch.Tensor), (
-                f"Loss component '{metric_name}' not found in metrics_tensors_step. "
-                f"Available: {list(loss_manager.metrics_tensors_step.keys())}"
-            )
-            assert tensor.requires_grad, (
-                f"Loss tensor for '{metric_name}' does not require grad. "
-                f"Cannot compute gradient norms."
-            )
+        # Temporarily disable donated_buffer optimization which is
+        # incompatible with retain_graph=True under torch.compile.
+        import torch._functorch.config as functorch_config
 
-            # Compute gradient norm for this loss component.
-            # Temporarily disable donated_buffer optimization which is
-            # incompatible with retain_graph=True under torch.compile.
-            import torch._functorch.config as functorch_config
+        old_donated = functorch_config.donated_buffer
+        functorch_config.donated_buffer = False
+        try:
+            gnorms = {}
+            for metric_name in self.target_fractions:
+                tensor = loss_manager.metrics_tensors_step.get(metric_name)
+                # Skip metrics that are missing or don't have grad on this
+                # batch — common with ConcatDataset where some batches have
+                # all-NaN data for certain loss components (e.g. stress on
+                # energy-only frames). The EMA from previous measurements
+                # carries forward for skipped metrics.
+                if tensor is None or not isinstance(tensor, torch.Tensor):
+                    continue
+                if not tensor.requires_grad:
+                    continue
 
-            old_donated = functorch_config.donated_buffer
-            functorch_config.donated_buffer = False
-            try:
                 grads = torch.autograd.grad(
                     tensor,
                     params,
                     retain_graph=True,
                     allow_unused=True,
                 )
-            finally:
-                functorch_config.donated_buffer = old_donated
-            # Compute total gradient norm across all parameters
-            gnorm_sq = 0.0
-            for g in grads:
-                if g is not None:
-                    gnorm_sq += g.detach().norm().item() ** 2
-            gnorms[metric_name] = gnorm_sq ** 0.5
+                gnorm_sq = 0.0
+                for g in grads:
+                    if g is not None:
+                        gnorm_sq += g.detach().norm().item() ** 2
+                gnorms[metric_name] = gnorm_sq ** 0.5
+        finally:
+            functorch_config.donated_buffer = old_donated
 
         self._update_from_gnorms(gnorms, pl_module)
 
@@ -265,19 +264,34 @@ class GradientNormFractionScheduler(Callback):
         gnorms: Dict[str, float],
         pl_module: NequIPLightningModule,
     ):
-        """Update coefficients based on measured gradient norms."""
-        if len(gnorms) != len(self.target_fractions):
+        """Update coefficients based on measured gradient norms.
+
+        Handles partial measurements: only metrics that produced valid
+        gradients on this batch are updated. The EMA for unmeasured
+        metrics carries forward from previous measurements. Coefficient
+        updates only happen once all metrics have been initialized.
+        """
+        if not gnorms:
             return
 
-        # EMA smooth
+        # EMA smooth — initialize or update
         if self.smoothed_gnorms is None:
-            self.smoothed_gnorms = dict(gnorms)
+            # First measurement: need all metrics present to initialize
+            if len(gnorms) == len(self.target_fractions):
+                self.smoothed_gnorms = dict(gnorms)
+            else:
+                return  # wait until we've seen all metrics
         else:
+            # Update only the metrics that were measured this step
             for k in gnorms:
                 self.smoothed_gnorms[k] = (
                     self.ema_decay * self.smoothed_gnorms[k]
                     + (1 - self.ema_decay) * gnorms[k]
                 )
+
+        # Only update coefficients if all metrics have smoothed values
+        if len(self.smoothed_gnorms) != len(self.target_fractions):
+            return
 
         # Compute coefficients: coeff_i = target_i / smoothed_gnorm_i
         new_coeffs = {}
