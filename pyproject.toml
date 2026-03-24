@@ -18,5 +18,8 @@ dev = [
     "pytest",
 ]
 
+[project.entry-points."nequip.extension"]
+init_always = "nequip_multihead"
+
 [tool.setuptools.packages.find]
 include = ["nequip_multihead*"]
