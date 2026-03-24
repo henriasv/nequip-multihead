@@ -52,6 +52,25 @@ training_module:
 **Do not use `forces_rms` for energy-only heads.** This causes the readout to operate at very small values, degrading the numerical quality of autograd forces and producing unstable molecular dynamics. For energy-only heads, use `1.0` (no scaling).
 ```
 
+### NaN-safe statistics
+
+When using `ConcatDataset` with energy-only heads, the standard `CommonDataStatisticsManager` computes `forces_rms: nan` because NaN forces are included. Use the extension's NaN-safe stats manager instead:
+
+```yaml
+data:
+  stats_manager:
+    _target_: nequip_multihead.data.MultiHeadDataStatisticsManager
+    type_names: ${model_type_names}
+```
+
+This allows `${training_data_stats:forces_rms}` to work correctly — only finite force values contribute to the RMS. You can then use it safely for force-supervised heads:
+
+```yaml
+per_type_energy_scales:
+  baseline: ${training_data_stats:forces_rms}   # safe with MultiHeadDataStatisticsManager
+  delta: 1.0                                     # energy-only: no scaling
+```
+
 ## Data
 
 Use `ConcatDataset` to combine datasets from different levels of theory into a single dataloader. Each dataset is stamped with a head index via `HeadStamper`:

@@ -12,7 +12,11 @@ per_type_energy_scales:
 
 ## NaN forces_rms from ConcatDataset
 
-When `ConcatDataset` mixes force-supervised and energy-only data, `CommonDataStatisticsManager` computes `forces_rms: nan` (because NaN forces are included). Do **not** use `${training_data_stats:forces_rms}` as energy scales — specify them explicitly.
+When `ConcatDataset` mixes force-supervised and energy-only data, the default `CommonDataStatisticsManager` computes `forces_rms: nan` (because NaN forces are included).
+
+**Fix**: Use `nequip_multihead.data.MultiHeadDataStatisticsManager` instead — it uses `ignore_nan=True` for force statistics. See [Configuration: NaN-safe statistics](configuration.md#nan-safe-statistics).
+
+Alternatively, specify energy scales explicitly (e.g. `per_type_energy_scales: {baseline: 10.0, delta: 1.0}`).
 
 ## EnergyForceLoss vs EnergyForceStressLoss
 
