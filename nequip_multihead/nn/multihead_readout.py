@@ -101,7 +101,12 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
             out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
         )
 
-        # Set up irreps
+        # Set up irreps — include HEAD_KEY so GraphModel passes it through
+        if irreps_in is not None:
+            irreps_in = dict(irreps_in)
+        else:
+            irreps_in = {}
+        irreps_in[HEAD_KEY] = None  # non-tensor irreps (integer field)
         self._init_irreps(
             irreps_in=irreps_in,
             irreps_out=self.reduce.irreps_out,
