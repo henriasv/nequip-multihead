@@ -295,9 +295,15 @@ class GradientNormFractionScheduler(Callback):
         old_donated = functorch_config.donated_buffer
         functorch_config.donated_buffer = False
         try:
+            # Copy batch to avoid issues from compiled training step
+            # having mutated the data dict
+            batch_copy = {
+                k: v.clone() if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
             with torch.compiler.disable():
-                target = pl_module.process_target(batch, batch_idx)
-                output = pl_module(batch)
+                target = pl_module.process_target(batch_copy, batch_idx)
+                output = pl_module(batch_copy)
                 loss_manager(output, target, prefix="_gnorm_")
 
             gnorms = {}
