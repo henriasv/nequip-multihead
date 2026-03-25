@@ -19,3 +19,4 @@ Key features:
 
    intro/intro
    guide/guide
+   api/api

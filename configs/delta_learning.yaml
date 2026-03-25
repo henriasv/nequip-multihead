@@ -1,0 +1,174 @@
+# Delta-learning example: baseline (energy+forces) + delta (energy only).
+#
+# Demonstrates:
+#   - per_head_l_max: constrain delta head to l=0 for better force quality
+#   - ignore_nan: handle NaN forces in energy-only delta data
+#   - MultiHeadDataStatisticsManager: NaN-safe forces_rms computation
+#   - GradientNormFractionScheduler: dynamic loss coefficient scheduling
+#
+# After training, compile for deployment:
+#   # Single head:
+#   nequip-compile last.ckpt baseline.pt2 --mode aotinductor --device cuda \
+#     --target ase --modifiers extract_head head_name=baseline
+#
+#   # Summed heads (delta-learning):
+#   nequip-compile last.ckpt target.pt2 --mode aotinductor --device cuda \
+#     --target ase --modifiers extract_summed_heads head_names=baseline+delta
+#
+# Replace file_path values with your actual data paths.
+
+run: [train]
+
+seed: 42
+cutoff_radius: 6.0
+model_type_names: [H, O]
+chemical_species: ${model_type_names}
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: 5
+  num_workers: 2
+
+data:
+  _target_: nequip.data.datamodule.NequIPDataModule
+  seed: ${seed}
+
+  train_dataset:
+    _target_: torch.utils.data.ConcatDataset
+    datasets:
+      # Head 0: baseline DFT with energy + forces
+      - _target_: nequip.data.dataset.ASEDataset
+        file_path: baseline_train.xyz   # REPLACE with your data
+        transforms:
+          - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+            model_type_names: ${model_type_names}
+            chemical_species_to_atom_type_map:
+              H: H
+              O: O
+          - _target_: nequip.data.transforms.NeighborListTransform
+            r_max: ${cutoff_radius}
+          - _target_: nequip_multihead.transforms.HeadStamper
+            head_index: 0
+
+      # Head 1: delta correction, energy only (NaN forces)
+      - _target_: nequip.data.dataset.ASEDataset
+        file_path: delta_train.xyz      # REPLACE with your data
+        transforms:
+          - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+            model_type_names: ${model_type_names}
+            chemical_species_to_atom_type_map:
+              H: H
+              O: O
+          - _target_: nequip.data.transforms.NeighborListTransform
+            r_max: ${cutoff_radius}
+          - _target_: nequip_multihead.transforms.HeadStamper
+            head_index: 1
+
+  val_dataset:
+    - _target_: nequip.data.dataset.ASEDataset
+      file_path: baseline_val.xyz       # REPLACE
+      transforms:
+        - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+          model_type_names: ${model_type_names}
+          chemical_species_to_atom_type_map:
+            H: H
+            O: O
+        - _target_: nequip.data.transforms.NeighborListTransform
+          r_max: ${cutoff_radius}
+        - _target_: nequip_multihead.transforms.HeadStamper
+          head_index: 0
+
+  train_dataloader: ${dataloader}
+  val_dataloader: ${dataloader}
+  stats_manager:
+    _target_: nequip_multihead.data.MultiHeadDataStatisticsManager
+    type_names: ${model_type_names}
+
+trainer:
+  _target_: lightning.Trainer
+  accelerator: gpu
+  devices: 1
+  max_epochs: 300
+  check_val_every_n_epoch: 10
+  log_every_n_steps: 10
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      monitor: val0_epoch/weighted_sum
+      dirpath: ${hydra:runtime.output_dir}
+      filename: best
+      save_last: true
+    - _target_: nequip_multihead.train.callbacks.GradientNormFractionScheduler
+      initial_target_fractions:
+        forces_mse: 0.80
+        per_atom_energy_mse: 0.10
+        stress_mse: 0.10
+      target_fractions:
+        forces_mse: 0.40
+        per_atom_energy_mse: 0.40
+        stress_mse: 0.20
+      ramp_start_epoch: 50
+      ramp_end_epoch: 200
+      frequency: 50
+
+training_module:
+  _target_: nequip.train.EMALightningModule
+  loss:
+    _target_: nequip.train.EnergyForceStressLoss
+    per_atom_energy: true
+    coeffs:
+      total_energy: 1.0
+      forces: 10.0
+      stress: 0.0
+    ignore_nan:
+      forces: true
+      stress: true
+  val_metrics:
+    _target_: nequip.train.EnergyForceStressMetrics
+    coeffs:
+      total_energy_mae: 1.0
+      forces_mae: 1.0
+      stress_mae: 0.0
+    ignore_nan:
+      forces: true
+      stress: true
+  train_metrics: null
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.003
+  lr_scheduler:
+    _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+    T_max: 300
+    eta_min: 1.0e-6
+  model:
+    _target_: nequip_multihead.model.MultiHeadNequIPGNNModel
+    seed: ${seed}
+    model_dtype: float64
+    type_names: ${model_type_names}
+    r_max: ${cutoff_radius}
+    l_max: 2
+    parity: true
+    num_layers: 4
+    num_features: 64
+    radial_mlp_depth: 2
+    radial_mlp_width: 64
+    avg_num_neighbors: ${training_data_stats:num_neighbors_mean}
+    head_names: [baseline, delta]
+
+    # Per-head l_max: constrain delta head to scalar TP paths
+    per_head_l_max:
+      baseline: 2    # full l_max (force-supervised)
+      delta: 0       # scalar only (energy-only, constrained decomposition)
+
+    # Per-head energy shifts (isolated atom energies per level of theory)
+    per_type_energy_shifts:
+      baseline:
+        H: -13.587    # REPLACE with your DFT E0
+        O: -431.267
+      delta:
+        H: -0.37      # REPLACE with your delta E0
+        O: -9.73
+
+    # Per-head energy scales
+    per_type_energy_scales:
+      baseline: ${training_data_stats:forces_rms}
+      delta: 1.0      # energy-only: do NOT use forces_rms
