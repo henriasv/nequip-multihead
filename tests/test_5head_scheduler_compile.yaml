@@ -1,0 +1,212 @@
+# Test config: 5-head model with mixed data types + scheduler + compile
+#
+# Head 0: Cu — energy + forces + stress (full supervision)
+# Head 1: Al — energy + forces + stress (full supervision)
+# Head 2: Cu — energy only (NaN forces, NaN stress)
+# Head 3: Al — energy + forces only (NaN stress)
+# Head 4: Cu — energy + stress only (NaN forces)
+#
+# This tests the hardest case: different data availability per head,
+# NaN handling, scheduler with partial gradients, all under compile.
+
+run: [train]
+
+seed: 42
+cutoff_radius: 4.0
+model_type_names: [Cu, Al]
+chemical_species: ${model_type_names}
+
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: 5
+
+data:
+  _target_: nequip.data.datamodule.NequIPDataModule
+  seed: ${seed}
+
+  train_dataset:
+    _target_: torch.utils.data.ConcatDataset
+    datasets:
+      # Head 0: Cu — full supervision
+      - _target_: nequip.data.dataset.EMTTestDataset
+        transforms:
+          - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+            model_type_names: ${model_type_names}
+            chemical_species_to_atom_type_map:
+              Cu: Cu
+          - _target_: nequip.data.transforms.NeighborListTransform
+            r_max: ${cutoff_radius}
+          - _target_: nequip_multihead.transforms.HeadStamper
+            head_index: 0
+        supercell: [2, 2, 2]
+        seed: 42
+        num_frames: 10
+        element: Cu
+
+      # Head 1: Al — full supervision
+      - _target_: nequip.data.dataset.EMTTestDataset
+        transforms:
+          - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+            model_type_names: ${model_type_names}
+            chemical_species_to_atom_type_map:
+              Al: Al
+          - _target_: nequip.data.transforms.NeighborListTransform
+            r_max: ${cutoff_radius}
+          - _target_: nequip_multihead.transforms.HeadStamper
+            head_index: 1
+        supercell: [2, 2, 2]
+        seed: 43
+        num_frames: 10
+        element: Al
+
+      # Head 2: Cu — energy only (NaN forces, NaN stress)
+      - _target_: nequip.data.dataset.EMTTestDataset
+        transforms:
+          - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+            model_type_names: ${model_type_names}
+            chemical_species_to_atom_type_map:
+              Cu: Cu
+          - _target_: nequip.data.transforms.NeighborListTransform
+            r_max: ${cutoff_radius}
+          - _target_: nequip_multihead.transforms.HeadStamper
+            head_index: 2
+            nan_keys: [forces, stress]
+        supercell: [2, 2, 2]
+        seed: 44
+        num_frames: 10
+        element: Cu
+
+      # Head 3: Al — energy + forces (NaN stress)
+      - _target_: nequip.data.dataset.EMTTestDataset
+        transforms:
+          - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+            model_type_names: ${model_type_names}
+            chemical_species_to_atom_type_map:
+              Al: Al
+          - _target_: nequip.data.transforms.NeighborListTransform
+            r_max: ${cutoff_radius}
+          - _target_: nequip_multihead.transforms.HeadStamper
+            head_index: 3
+            nan_keys: [stress]
+        supercell: [2, 2, 2]
+        seed: 45
+        num_frames: 10
+        element: Al
+
+      # Head 4: Cu — energy + stress (NaN forces)
+      - _target_: nequip.data.dataset.EMTTestDataset
+        transforms:
+          - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+            model_type_names: ${model_type_names}
+            chemical_species_to_atom_type_map:
+              Cu: Cu
+          - _target_: nequip.data.transforms.NeighborListTransform
+            r_max: ${cutoff_radius}
+          - _target_: nequip_multihead.transforms.HeadStamper
+            head_index: 4
+            nan_keys: [forces]
+        supercell: [2, 2, 2]
+        seed: 46
+        num_frames: 10
+        element: Cu
+
+  val_dataset:
+    - _target_: nequip.data.dataset.EMTTestDataset
+      transforms:
+        - _target_: nequip.data.transforms.ChemicalSpeciesToAtomTypeMapper
+          model_type_names: ${model_type_names}
+          chemical_species_to_atom_type_map:
+            Cu: Cu
+        - _target_: nequip.data.transforms.NeighborListTransform
+          r_max: ${cutoff_radius}
+        - _target_: nequip_multihead.transforms.HeadStamper
+          head_index: 0
+      supercell: [2, 2, 2]
+      seed: 999
+      num_frames: 5
+      element: Cu
+
+  train_dataloader: ${dataloader}
+  val_dataloader: ${dataloader}
+  stats_manager:
+    _target_: nequip_multihead.data.MultiHeadDataStatisticsManager
+    type_names: ${model_type_names}
+
+trainer:
+  _target_: lightning.Trainer
+  accelerator: gpu
+  devices: 1
+  max_epochs: 5
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 5
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      dirpath: ${hydra:runtime.output_dir}
+      filename: best
+      save_last: true
+    - _target_: nequip_multihead.train.callbacks.GradientNormFractionScheduler
+      target_fractions:
+        forces_mse: 0.50
+        per_atom_energy_mse: 0.30
+        stress_mse: 0.20
+      frequency: 5
+      ema_decay: 0.9
+
+training_module:
+  _target_: nequip.train.EMALightningModule
+  loss:
+    _target_: nequip.train.EnergyForceStressLoss
+    per_atom_energy: true
+    coeffs:
+      total_energy: 1.0
+      forces: 10.0
+      stress: 1.0
+    ignore_nan:
+      forces: true
+      stress: true
+  val_metrics:
+    _target_: nequip.train.EnergyForceStressMetrics
+    ignore_nan:
+      forces: true
+      stress: true
+  train_metrics: null
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.01
+  model:
+    _target_: nequip_multihead.model.MultiHeadNequIPGNNModel
+    seed: ${seed}
+    model_dtype: float32
+    compile_mode: compile
+    type_names: ${model_type_names}
+    r_max: ${cutoff_radius}
+    l_max: 1
+    parity: true
+    num_layers: 2
+    num_features: 16
+    radial_mlp_depth: 1
+    radial_mlp_width: 16
+    avg_num_neighbors: ${training_data_stats:num_neighbors_mean}
+    head_names: [full_Cu, full_Al, energy_only_Cu, force_Al, stress_Cu]
+    per_type_energy_scales:
+      full_Cu: ${training_data_stats:forces_rms}
+      full_Al: ${training_data_stats:forces_rms}
+      energy_only_Cu: ${training_data_stats:forces_rms}
+      force_Al: ${training_data_stats:forces_rms}
+      stress_Cu: ${training_data_stats:forces_rms}
+    per_type_energy_shifts:
+      full_Cu:
+        Cu: 0.0
+        Al: 0.0
+      full_Al:
+        Cu: 0.0
+        Al: 0.0
+      energy_only_Cu:
+        Cu: 0.0
+        Al: 0.0
+      force_Al:
+        Cu: 0.0
+        Al: 0.0
+      stress_Cu:
+        Cu: 0.0
+        Al: 0.0

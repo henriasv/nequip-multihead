@@ -141,11 +141,9 @@ class GradientNormFractionScheduler(Callback):
     """Adjust loss coefficients to maintain target gradient-norm fractions.
 
     Every ``frequency`` steps, computes the gradient norm that each loss component
-    contributes to the total parameter update. Uses ``torch.autograd.grad`` with
-    ``retain_graph=True`` on individual loss components before the main backward pass.
-
-    The computation happens in ``on_before_backward`` when the computation graph
-    is still alive, allowing separate gradient computation for each loss component.
+    contributes to the total parameter update. Runs a separate eager forward pass
+    (bypassing ``CompileGraphModel`` if present) and uses ``torch.autograd.grad``
+    with ``retain_graph=True`` on the resulting loss tensors.
 
     **Cost:** N calls to ``torch.autograd.grad`` every ``frequency`` steps.
     Each call traverses the backward graph but does NOT accumulate gradients
@@ -265,10 +263,16 @@ class GradientNormFractionScheduler(Callback):
     ):
         """Measure per-component gradient norms after the training step.
 
-        Runs an **eager** forward pass (bypassing torch.compile) on the
-        current batch, computes individual loss components, and measures
-        gradient norms via ``torch.autograd.grad``. This avoids conflicts
-        with torch.compile's inplace tensor optimizations.
+        Runs a truly eager forward pass (bypassing ``CompileGraphModel``)
+        on the current batch, computes individual loss components, and
+        measures gradient norms via ``torch.autograd.grad``.
+
+        NequIP's ``CompileGraphModel`` wraps the model with manually
+        FX-traced + ``torch.compile``'d graphs, so ``@_dynamo.disable``
+        does NOT prevent compilation — the compiled dispatch happens inside
+        ``CompileGraphModel.forward()``.  The fix is to call
+        ``GraphModel.forward()`` (the parent class) explicitly, which runs
+        the raw uncompiled inner module.
 
         Cost: one extra eager forward + N backward passes every
         ``frequency`` steps. The compiled path handles 99% of steps.
@@ -288,56 +292,53 @@ class GradientNormFractionScheduler(Callback):
             "support in MetricsManager. Update your nequip installation."
         )
 
-        # Run an eager forward pass (no compile, no inplace ops) so that
-        # autograd.grad with retain_graph=True works correctly.
-        # Import sub-modules before any use of torch.Tensor to avoid
-        # shadowing issues in some Python/PyTorch versions.
-        import torch._functorch.config as functorch_config
-        import torch._dynamo as _dynamo
+        from nequip.nn.graph_model import GraphModel
+        from nequip.nn.compile import CompileGraphModel
 
-        @_dynamo.disable
-        def _eager_forward(model, data):
-            return model(data)
+        # Resolve the graph model inside the LightningModule.
+        # NequIPLightningModule stores it as self.model["sole_model"].
+        graph_model = pl_module.model["sole_model"]
 
-        @_dynamo.disable
-        def _eager_loss(loss_mgr, out, tgt):
-            return loss_mgr(out, tgt, prefix="_gnorm_")
+        # Copy batch to avoid issues from compiled training step
+        # having mutated the data dict.
+        batch_copy = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
 
-        old_donated = functorch_config.donated_buffer
-        functorch_config.donated_buffer = False
-        try:
-            # Copy batch to avoid issues from compiled training step
-            # having mutated the data dict
-            batch_copy = {
-                k: v.clone() if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
+        target = pl_module.process_target(batch_copy, batch_idx)
 
-            target = pl_module.process_target(batch_copy, batch_idx)
-            output = _eager_forward(pl_module, batch_copy)
-            _eager_loss(loss_manager, output, target)
+        # Run truly eager forward: if the model is a CompileGraphModel,
+        # call GraphModel.forward() (the parent) to bypass the compiled
+        # dispatch entirely. This produces tensors whose computation graph
+        # has no inplace-modified intermediates, so retain_graph=True works.
+        with torch.enable_grad():
+            if isinstance(graph_model, CompileGraphModel):
+                output = GraphModel.forward(graph_model, batch_copy)
+            else:
+                output = graph_model(batch_copy)
 
-            gnorms = {}
-            for metric_name in self.target_fractions:
-                tensor = loss_manager.metrics_tensors_step.get(metric_name)
-                if tensor is None or not isinstance(tensor, torch.Tensor):
-                    continue
-                if not tensor.requires_grad:
-                    continue
+        loss_manager(output, target, prefix="_gnorm_")
 
-                grads = torch.autograd.grad(
-                    tensor,
-                    params,
-                    retain_graph=True,
-                    allow_unused=True,
-                )
-                gnorm_sq = 0.0
-                for g in grads:
-                    if g is not None:
-                        gnorm_sq += g.detach().norm().item() ** 2
-                gnorms[metric_name] = gnorm_sq ** 0.5
-        finally:
-            functorch_config.donated_buffer = old_donated
+        gnorms = {}
+        for metric_name in self.target_fractions:
+            tensor = loss_manager.metrics_tensors_step.get(metric_name)
+            if tensor is None or not isinstance(tensor, torch.Tensor):
+                continue
+            if not tensor.requires_grad:
+                continue
+
+            grads = torch.autograd.grad(
+                tensor,
+                params,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            gnorm_sq = 0.0
+            for g in grads:
+                if g is not None:
+                    gnorm_sq += g.detach().norm().item() ** 2
+            gnorms[metric_name] = gnorm_sq ** 0.5
 
         self._update_from_gnorms(gnorms, trainer, pl_module)
 
