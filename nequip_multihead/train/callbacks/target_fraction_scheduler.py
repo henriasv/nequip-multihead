@@ -163,36 +163,97 @@ class GradientNormFractionScheduler(Callback):
             ema_decay: 0.95
 
     Args:
-        target_fractions: dict mapping loss metric names to target gradient fractions
+        target_fractions: dict mapping loss metric names to target gradient fractions (final values)
+        initial_target_fractions: optional dict of starting fractions (default: same as final).
+            When set, fractions linearly interpolate from initial to final between
+            ``ramp_start_epoch`` and ``ramp_end_epoch``.
+        ramp_start_epoch: epoch to start ramping (default: 0)
+        ramp_end_epoch: epoch to reach final targets (default: 100)
         frequency: number of training steps between measurements
         ema_decay: EMA decay for smoothing gradient norm estimates
         eps: small value to avoid division by zero
+
+    Example with ramping::
+
+        callbacks:
+          - _target_: nequip_multihead.train.callbacks.GradientNormFractionScheduler
+            initial_target_fractions:
+              forces_mse: 0.80
+              per_atom_energy_mse: 0.10
+              stress_mse: 0.10
+            target_fractions:
+              forces_mse: 0.40
+              per_atom_energy_mse: 0.40
+              stress_mse: 0.20
+            ramp_start_epoch: 50
+            ramp_end_epoch: 200
+            frequency: 50
     """
 
     def __init__(
         self,
         target_fractions: Dict[str, float],
+        initial_target_fractions: Optional[Dict[str, float]] = None,
+        ramp_start_epoch: int = 0,
+        ramp_end_epoch: int = 100,
         frequency: int = 100,
         ema_decay: float = 0.95,
         eps: float = 1e-12,
     ):
         assert frequency >= 1
 
-        frac_sum = sum(target_fractions.values())
-        assert abs(frac_sum - 1.0) < 0.05, (
-            f"target_fractions must sum to ~1.0, got {frac_sum}"
-        )
-        target_fractions = {k: v / frac_sum for k, v in target_fractions.items()}
-        assert all(v > 0 for v in target_fractions.values()), (
-            "all target_fractions must be positive"
+        def _normalize(fracs):
+            frac_sum = sum(fracs.values())
+            assert abs(frac_sum - 1.0) < 0.05, (
+                f"target_fractions must sum to ~1.0, got {frac_sum}"
+            )
+            fracs = {k: v / frac_sum for k, v in fracs.items()}
+            assert all(v > 0 for v in fracs.values()), (
+                "all target_fractions must be positive"
+            )
+            return fracs
+
+        self.target_fractions = _normalize(target_fractions)
+
+        if initial_target_fractions is not None:
+            assert set(initial_target_fractions.keys()) == set(target_fractions.keys()), (
+                "initial_target_fractions must have same keys as target_fractions"
+            )
+            self.initial_target_fractions = _normalize(initial_target_fractions)
+        else:
+            self.initial_target_fractions = None
+
+        self.ramp_start_epoch = ramp_start_epoch
+        self.ramp_end_epoch = ramp_end_epoch
+        assert ramp_end_epoch > ramp_start_epoch, (
+            "ramp_end_epoch must be > ramp_start_epoch"
         )
 
-        self.target_fractions = target_fractions
         self.frequency = frequency
         self.ema_decay = ema_decay
         self.eps = eps
 
         self.smoothed_gnorms: Optional[Dict[str, float]] = None
+
+    def _get_current_targets(self, epoch: int) -> Dict[str, float]:
+        """Get interpolated target fractions for the current epoch."""
+        if self.initial_target_fractions is None:
+            return self.target_fractions
+
+        if epoch <= self.ramp_start_epoch:
+            return self.initial_target_fractions
+        elif epoch >= self.ramp_end_epoch:
+            return self.target_fractions
+        else:
+            # Linear interpolation
+            t = (epoch - self.ramp_start_epoch) / (
+                self.ramp_end_epoch - self.ramp_start_epoch
+            )
+            return {
+                k: (1 - t) * self.initial_target_fractions[k]
+                + t * self.target_fractions[k]
+                for k in self.target_fractions
+            }
 
     def on_before_backward(
         self,
@@ -257,11 +318,12 @@ class GradientNormFractionScheduler(Callback):
         finally:
             functorch_config.donated_buffer = old_donated
 
-        self._update_from_gnorms(gnorms, pl_module)
+        self._update_from_gnorms(gnorms, trainer, pl_module)
 
     def _update_from_gnorms(
         self,
         gnorms: Dict[str, float],
+        trainer: "lightning.Trainer",
         pl_module: NequIPLightningModule,
     ):
         """Update coefficients based on measured gradient norms.
@@ -270,6 +332,10 @@ class GradientNormFractionScheduler(Callback):
         gradients on this batch are updated. The EMA for unmeasured
         metrics carries forward from previous measurements. Coefficient
         updates only happen once all metrics have been initialized.
+
+        Uses time-varying target fractions if ``initial_target_fractions``
+        was set — linearly interpolates between initial and final targets
+        based on the current epoch.
         """
         if not gnorms:
             return
@@ -293,11 +359,14 @@ class GradientNormFractionScheduler(Callback):
         if len(self.smoothed_gnorms) != len(self.target_fractions):
             return
 
+        # Get current targets (possibly interpolated)
+        current_targets = self._get_current_targets(trainer.current_epoch)
+
         # Compute coefficients: coeff_i = target_i / smoothed_gnorm_i
         new_coeffs = {}
-        for k in self.target_fractions:
+        for k in current_targets:
             g = max(self.smoothed_gnorms[k], self.eps)
-            new_coeffs[k] = self.target_fractions[k] / g
+            new_coeffs[k] = current_targets[k] / g
 
         # Normalize to sum to 1
         total = sum(new_coeffs.values())
@@ -308,6 +377,9 @@ class GradientNormFractionScheduler(Callback):
     def state_dict(self):
         return {
             "target_fractions": self.target_fractions,
+            "initial_target_fractions": self.initial_target_fractions,
+            "ramp_start_epoch": self.ramp_start_epoch,
+            "ramp_end_epoch": self.ramp_end_epoch,
             "frequency": self.frequency,
             "ema_decay": self.ema_decay,
             "eps": self.eps,
@@ -316,6 +388,9 @@ class GradientNormFractionScheduler(Callback):
 
     def load_state_dict(self, state_dict):
         self.target_fractions = state_dict["target_fractions"]
+        self.initial_target_fractions = state_dict.get("initial_target_fractions")
+        self.ramp_start_epoch = state_dict.get("ramp_start_epoch", 0)
+        self.ramp_end_epoch = state_dict.get("ramp_end_epoch", 100)
         self.frequency = state_dict["frequency"]
         self.ema_decay = state_dict["ema_decay"]
         self.eps = state_dict["eps"]

@@ -180,10 +180,17 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
     def extract_summed_heads(cls, model, head_names: str):
         """Extract and sum multiple heads for delta-learning deployment.
 
-        Use via ``nequip-compile --modifiers extract_summed_heads head_names=dft+rpa``.
-        The ``head_names`` argument uses ``+`` as separator.
+        Use via ``nequip-compile --modifiers extract_summed_heads head_names=dft+rpa``
+        or ``head_names=dft,rpa``. Both ``+`` and ``,`` are accepted as separators.
+
+        The compiled model sums the per-atom energies from all specified heads.
+        Forces and stress are computed from the summed energy via autograd.
         """
         from nequip_multihead.model.extract_head import extract_summed_heads
 
-        names = head_names.split("+")
+        # Support both + and , as separators
+        if "+" in head_names:
+            names = head_names.split("+")
+        else:
+            names = head_names.split(",")
         return extract_summed_heads(model, names)
