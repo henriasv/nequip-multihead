@@ -17,9 +17,7 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 html_theme = "furo"
 html_static_path = ["_static"]
 
-html_theme_options = {
-    "sidebar_hide_name": True,
-}
+html_theme_options = {}
 
 myst_enable_extensions = [
     "colon_fence",
