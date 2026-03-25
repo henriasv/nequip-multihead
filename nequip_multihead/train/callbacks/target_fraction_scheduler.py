@@ -290,7 +290,18 @@ class GradientNormFractionScheduler(Callback):
 
         # Run an eager forward pass (no compile, no inplace ops) so that
         # autograd.grad with retain_graph=True works correctly.
+        # Import sub-modules before any use of torch.Tensor to avoid
+        # shadowing issues in some Python/PyTorch versions.
         import torch._functorch.config as functorch_config
+        import torch._dynamo as _dynamo
+
+        @_dynamo.disable
+        def _eager_forward(model, data):
+            return model(data)
+
+        @_dynamo.disable
+        def _eager_loss(loss_mgr, out, tgt):
+            return loss_mgr(out, tgt, prefix="_gnorm_")
 
         old_donated = functorch_config.donated_buffer
         functorch_config.donated_buffer = False
@@ -301,17 +312,6 @@ class GradientNormFractionScheduler(Callback):
                 k: v.clone() if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
-            # Use torch._dynamo.disable as a decorator (not context manager)
-            # for compatibility with PyTorch 2.8+
-            import torch._dynamo
-
-            @torch._dynamo.disable
-            def _eager_forward(model, data):
-                return model(data)
-
-            @torch._dynamo.disable
-            def _eager_loss(loss_mgr, out, tgt):
-                return loss_mgr(out, tgt, prefix="_gnorm_")
 
             target = pl_module.process_target(batch_copy, batch_idx)
             output = _eager_forward(pl_module, batch_copy)
