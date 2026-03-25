@@ -255,50 +255,54 @@ class GradientNormFractionScheduler(Callback):
                 for k in self.target_fractions
             }
 
-    def on_before_backward(
+    def on_train_batch_end(
         self,
         trainer: lightning.Trainer,
         pl_module: NequIPLightningModule,
-        loss: torch.Tensor,
+        outputs,
+        batch,
+        batch_idx: int,
     ):
-        """Measure per-component gradient norms before the main backward pass.
+        """Measure per-component gradient norms after the training step.
 
-        Uses ``torch.autograd.grad`` with ``retain_graph=True`` on each cached
-        loss tensor from ``MetricsManager.metrics_tensors_step``. This gives
-        the true gradient norm contribution from each loss component.
+        Runs an **eager** forward pass (bypassing torch.compile) on the
+        current batch, computes individual loss components, and measures
+        gradient norms via ``torch.autograd.grad``. This avoids conflicts
+        with torch.compile's inplace tensor optimizations.
+
+        Cost: one extra eager forward + N backward passes every
+        ``frequency`` steps. The compiled path handles 99% of steps.
         """
         if trainer.global_step < 1:
             return
         if trainer.global_step % self.frequency != 0:
             return
 
-        # Get trainable parameters
         params = [p for p in pl_module.parameters() if p.requires_grad]
         if not params:
             return
 
-        # Access cached live loss tensors from the MetricsManager
         loss_manager = pl_module.loss
         assert hasattr(loss_manager, "metrics_tensors_step"), (
             "GradientNormFractionScheduler requires nequip with metrics_tensors_step "
             "support in MetricsManager. Update your nequip installation."
         )
 
-        # Temporarily disable donated_buffer optimization which is
-        # incompatible with retain_graph=True under torch.compile.
+        # Run an eager forward pass (no compile, no inplace ops) so that
+        # autograd.grad with retain_graph=True works correctly.
         import torch._functorch.config as functorch_config
 
         old_donated = functorch_config.donated_buffer
         functorch_config.donated_buffer = False
         try:
+            with torch.compiler.disable():
+                target = pl_module.process_target(batch, batch_idx)
+                output = pl_module(batch)
+                loss_manager(output, target, prefix="_gnorm_")
+
             gnorms = {}
             for metric_name in self.target_fractions:
                 tensor = loss_manager.metrics_tensors_step.get(metric_name)
-                # Skip metrics that are missing or don't have grad on this
-                # batch — common with ConcatDataset where some batches have
-                # all-NaN data for certain loss components (e.g. stress on
-                # energy-only frames). The EMA from previous measurements
-                # carries forward for skipped metrics.
                 if tensor is None or not isinstance(tensor, torch.Tensor):
                     continue
                 if not tensor.requires_grad:
