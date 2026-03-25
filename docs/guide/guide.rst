@@ -6,4 +6,5 @@ How-To Guides
    delta_learning
    loss_scheduling
    deployment
+   testing
    troubleshooting

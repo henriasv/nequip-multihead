@@ -22,6 +22,7 @@ a shared backbone and per-head readout networks.
    guide/delta_learning
    guide/loss_scheduling
    guide/deployment
+   guide/testing
    guide/troubleshooting
 
 .. toctree::
