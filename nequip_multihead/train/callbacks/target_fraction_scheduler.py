@@ -301,10 +301,21 @@ class GradientNormFractionScheduler(Callback):
                 k: v.clone() if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
             }
-            with torch.compiler.disable():
-                target = pl_module.process_target(batch_copy, batch_idx)
-                output = pl_module(batch_copy)
-                loss_manager(output, target, prefix="_gnorm_")
+            # Use torch._dynamo.disable as a decorator (not context manager)
+            # for compatibility with PyTorch 2.8+
+            import torch._dynamo
+
+            @torch._dynamo.disable
+            def _eager_forward(model, data):
+                return model(data)
+
+            @torch._dynamo.disable
+            def _eager_loss(loss_mgr, out, tgt):
+                return loss_mgr(out, tgt, prefix="_gnorm_")
+
+            target = pl_module.process_target(batch_copy, batch_idx)
+            output = _eager_forward(pl_module, batch_copy)
+            _eager_loss(loss_manager, output, target)
 
             gnorms = {}
             for metric_name in self.target_fractions:
