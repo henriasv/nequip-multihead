@@ -206,21 +206,9 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
                 head_instructions_sorted,
             )
 
-            # Compute weight index mapping: for each weight element in the head TP,
-            # find its position in the full TP's weight vector.
-            weight_indices = self._compute_weight_mapping(
-                full_instructions,
-                full_instructions_sorted,
-                full_perm,
-                full_tp_scatter.tp,
-                head_full_instruction_indices,
-                head_instructions,
-                head_instructions_sorted,
-                head_perm,
-                head_tp_scatter.tp,
-                feature_irreps_in,
-                irreps_edge_attr,
-            )
+            # The head's TP uses a contiguous prefix of the full TP's
+            # weight vector because instructions are sorted by l and
+            # lower-l paths come first. Verify this property holds.
 
             # linear_2: maps head's irreps_mid → scalar output
             head_linear_2 = Linear(
@@ -251,24 +239,20 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
 
             heads[head_name] = head_modules
 
-            # Verify weight indices are contiguous from 0 (required for
-            # simple slicing instead of fancy indexing, which is needed
-            # for AOT Inductor compatibility)
-            expected = torch.arange(len(weight_indices), dtype=torch.long)
-            assert torch.equal(weight_indices, expected), (
-                f"Weight indices for head '{head_name}' are not contiguous from 0: "
-                f"{weight_indices.tolist()[:10]}... This indicates the TP instruction "
-                f"sorting does not put lower-l paths first."
+            head_weight_numel = head_tp_scatter.tp.weight_numel
+            assert head_weight_numel <= full_weight_numel, (
+                f"Head '{head_name}' weight_numel ({head_weight_numel}) exceeds "
+                f"full weight_numel ({full_weight_numel})"
             )
 
-            # Register weight indices as buffer (kept for inspection/debugging)
-            self.register_buffer(
-                f"_weight_indices_{head_name}",
-                weight_indices,
+            # Verify contiguous prefix property by checking that matching
+            # instructions appear in the same order in both TPs
+            self._verify_contiguous_weights(
+                full_tp_scatter.tp, head_tp_scatter.tp, head_name
             )
 
             # Track per-head weight count for contiguous slicing
-            per_head_weight_numels[head_name] = len(weight_indices)
+            per_head_weight_numels[head_name] = head_weight_numel
 
             # Track output dimensions
             per_head_scalar_dims[head_name] = feature_irreps_out.dim
@@ -278,89 +262,50 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
         self._head_weight_numels = per_head_weight_numels
         self._activation = torch.nn.SiLU()
 
-        # Set output irreps (scalar features, same dim for all heads since
-        # all target feature_irreps_out is the same scalar irreps)
-        self.irreps_out.update(
-            {AtomicDataDict.NODE_FEATURES_KEY: feature_irreps_out}
-        )
+        # Set output irreps: scalar features for NODE_FEATURES_KEY,
+        # pass through all other keys from input (edge attrs, etc.)
+        self.irreps_out.update(self.irreps_in)
+        self.irreps_out[AtomicDataDict.NODE_FEATURES_KEY] = feature_irreps_out
 
-    def _compute_weight_mapping(
-        self,
-        full_instructions_unsorted,
-        full_instructions_sorted,
-        full_perm,
-        full_tp,
-        head_full_instruction_indices,
-        head_instructions_unsorted,
-        head_instructions_sorted,
-        head_perm,
-        head_tp,
-        feature_irreps_in,
-        irreps_edge_attr,
-    ):
-        """Compute index tensor mapping head TP weights → full TP weights.
+    @staticmethod
+    def _verify_contiguous_weights(full_tp, head_tp, head_name: str):
+        """Verify that the head's TP weights are a contiguous prefix of the full TP's.
 
-        Returns a 1D LongTensor of length head_tp.weight_numel where
-        indices[i] gives the position in the full weight vector.
+        This property holds because TP instructions are sorted by output irreps
+        (all scalar l=0), and input irreps are sorted by l. Lower-l input paths
+        appear first in both the full and head TPs, so the head's weight block
+        is always a prefix of the full weight block.
         """
-        # Compute per-instruction weight sizes and offsets for full TP
-        full_weight_offsets = []
-        offset = 0
-        for ins in full_tp.instructions:
-            if ins.has_weight:
-                size = prod(ins.path_shape)
-                full_weight_offsets.append((offset, size))
-                offset += size
-            else:
-                full_weight_offsets.append((0, 0))
+        # Match each head instruction to the corresponding full instruction
+        full_offset = 0
+        head_offset = 0
+        h_idx = 0
+        head_instructions = [ins for ins in head_tp.instructions if ins.has_weight]
+        full_instructions = [ins for ins in full_tp.instructions if ins.has_weight]
 
-        # Map from unsorted instruction index → sorted instruction index in full TP
-        # full_instructions_sorted uses full_perm to reorder outputs.
-        # We need to match head instructions to full instructions by their
-        # (i_in1, i_in2) pairs and the original unsorted index.
-
-        # Build mapping: for each head instruction (in sorted order),
-        # find the corresponding full instruction (in sorted order).
-        # We match by (i_in1, i_in2) since those uniquely identify a path
-        # when combined with the output irrep.
-
-        # First, map unsorted head instructions to unsorted full instructions
-        # head_full_instruction_indices[h] = index into full_instructions_unsorted
-
-        # The sorted order permutation for both TPs may differ.
-        # We need to work with the actual TensorProduct.instructions which
-        # are in the sorted order.
-
-        # Simpler approach: iterate over head_tp.instructions in order,
-        # match each to the corresponding full_tp instruction by (i_in1, i_in2, ir_out)
-        indices = []
-        for h_ins in head_tp.instructions:
-            if not h_ins.has_weight:
-                continue
-            h_size = prod(h_ins.path_shape)
-
-            # Find matching instruction in full TP
-            matched = False
-            for f_idx, f_ins in enumerate(full_tp.instructions):
-                if not f_ins.has_weight:
-                    continue
+        for f_ins in full_instructions:
+            f_size = prod(f_ins.path_shape)
+            if h_idx < len(head_instructions):
+                h_ins = head_instructions[h_idx]
                 if (
                     f_ins.i_in1 == h_ins.i_in1
                     and f_ins.i_in2 == h_ins.i_in2
-                    and full_tp.irreps_out[f_ins.i_out] == head_tp.irreps_out[h_ins.i_out]
                     and f_ins.path_shape == h_ins.path_shape
                 ):
-                    f_offset, f_size = full_weight_offsets[f_idx]
-                    assert f_size == h_size
-                    indices.extend(range(f_offset, f_offset + f_size))
-                    matched = True
-                    break
+                    # This full instruction matches the next head instruction
+                    assert full_offset == head_offset, (
+                        f"Head '{head_name}' weight offset mismatch: "
+                        f"full offset {full_offset} != head offset {head_offset} "
+                        f"at instruction {h_idx}. Weights are not contiguous."
+                    )
+                    head_offset += prod(h_ins.path_shape)
+                    h_idx += 1
+            full_offset += f_size
 
-            assert matched, (
-                f"Could not match head instruction {h_ins} to any full instruction"
-            )
-
-        return torch.tensor(indices, dtype=torch.long)
+        assert h_idx == len(head_instructions), (
+            f"Head '{head_name}': only matched {h_idx}/{len(head_instructions)} "
+            f"instructions to full TP"
+        )
 
     def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
         """Run per-head convolution.
