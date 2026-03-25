@@ -87,3 +87,7 @@ trainer:
 ```{note}
 Both schedulers require the ``metrics_tensors_step`` feature in NequIP's ``MetricsManager``, which is included in our NequIP fork (``henriasv/nequip@feature/parameterized-modifiers``).
 ```
+
+```{warning}
+The gradient norm measurement does not account for ``accumulate_grad_batches``. If gradient accumulation is enabled in the trainer, the measured gradient norms reflect a single batch, not the accumulated gradient. The relative fractions are still meaningful, but absolute norms will differ from the actual training update.
+```

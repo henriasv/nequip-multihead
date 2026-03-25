@@ -10,7 +10,6 @@ from math import prod
 from e3nn.o3._irreps import Irreps
 from e3nn.o3._linear import Linear
 from e3nn.o3._tensor_product._sub import FullyConnectedTensorProduct
-from e3nn.nn._gate import Gate
 
 from nequip.data import AtomicDataDict
 from nequip.nn._graph_mixin import GraphModuleMixin
@@ -18,7 +17,6 @@ from nequip.nn.mlp import ScalarMLPFunction
 from nequip.nn._tp_scatter_base import TensorProductScatter
 from nequip.nn.norm import AvgNumNeighborsNorm
 from nequip.nn._ghost_exchange_base import NoOpGhostExchangeModule
-from nequip.nn.utils import tp_path_exists
 
 from typing import Dict, List, Optional, Sequence, Union, Callable, Any
 
@@ -55,7 +53,7 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
         is_first_layer: bool = False,
         type_names: Optional[Sequence[str]] = None,
         avg_num_neighbors: Optional[Union[float, Dict[str, float]]] = None,
-        nonlinearity_scalars: Dict[int, Callable] = {"e": "silu", "o": "tanh"},
+        nonlinearity_scalars: Dict[str, str] = {"e": "silu", "o": "tanh"},
     ):
         super().__init__()
 
