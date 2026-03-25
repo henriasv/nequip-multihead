@@ -1,10 +1,9 @@
-User Guide
-==========
+How-To Guides
+=============
 
 .. toctree::
 
-   configuration
-   per_head_lmax
-   callbacks
-   compilation
-   gotchas
+   delta_learning
+   loss_scheduling
+   deployment
+   troubleshooting

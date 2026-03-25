@@ -1,0 +1,6 @@
+Explanation
+===========
+
+.. toctree::
+
+   architecture

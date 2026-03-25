@@ -2,21 +2,37 @@ nequip-multihead
 ================
 
 Multi-head training extension for `NequIP <https://github.com/mir-group/nequip>`_.
-Train a single model on multiple datasets with different levels of theory
-(e.g. DFT with forces + CCSD(T) energy only) using shared backbone and
-per-head readout networks.
+Train a single model on multiple datasets with different levels of theory using
+a shared backbone and per-head readout networks.
 
-Key features:
+.. code-block:: text
 
-- **Multi-head readout**: Per-head ``ScalarMLP`` + ``PerTypeScaleShift``, selected by ``HEAD_KEY``
-- **Per-head angular momentum** (``per_head_l_max``): Constrain energy-only heads to lower-l tensor product paths to improve autograd force quality
-- **Head extraction**: ``extract_head`` and ``extract_summed_heads`` model modifiers for deployment via ``nequip-compile``
-- **ConcatDataset integration**: Single dataloader with mixed-head batches, compatible with standard NequIP training
+   Data (DFT + CCSD(T)) → Train → Extract head → Compile → Deploy (ASE/LAMMPS)
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
+   :caption: Tutorial
 
-   intro/intro
-   guide/guide
+   getting_started
+
+.. toctree::
+   :maxdepth: 2
+   :caption: How-To Guides
+
+   guide/delta_learning
+   guide/loss_scheduling
+   guide/deployment
+   guide/troubleshooting
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Explanation
+
+   explanation/architecture
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Reference
+
    api/api
+   intro/intro
