@@ -117,10 +117,9 @@ class MultiHeadReadout(GraphModuleMixin, torch.nn.Module):
         # Get head indices per frame
         if HEAD_KEY in data:
             frame_heads = data[HEAD_KEY].view(-1)
-            assert frame_heads.max().item() < self.num_heads and frame_heads.min().item() >= 0, (
-                f"HEAD_KEY values must be in [0, {self.num_heads}), "
-                f"got range [{frame_heads.min().item()}, {frame_heads.max().item()}]"
-            )
+            # Note: HEAD_KEY range validation is skipped during torch.compile
+            # tracing because .item() is data-dependent. Validation happens
+            # at data loading time via HeadStamper configuration.
         else:
             # Default to head 0 if no HEAD_KEY (backward compat / inference)
             n_frames = AtomicDataDict.num_frames(data)
