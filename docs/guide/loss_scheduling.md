@@ -1,6 +1,6 @@
-# Dynamic Loss Scheduling
+# Training Schedule and SWA
 
-Adjust the relative weight of force, energy, and stress losses during training based on their actual gradient contributions.
+Tools for controlling loss coefficients and weight averaging during training.
 
 ## Why schedule loss coefficients?
 
@@ -74,4 +74,112 @@ Less accurate than gradient-norm scheduling but cheaper. Good for quick experime
 
 ```{warning}
 The gradient norm measurement does not account for `accumulate_grad_batches`. The relative fractions are still correct, but absolute norms reflect a single batch.
+```
+
+## Stochastic Weight Averaging (SWA)
+
+SWA stabilizes weights in late training by averaging model parameters over multiple epochs at a low learning rate. This produces smoother energy surfaces and more robust MD.  Inspired by MACE's "Stage Two" training.
+
+### Typical two-phase schedule
+
+1. **Phase 1**: Cosine annealing (e.g. 300 epochs, lr 0.01 → 0.001)
+2. **Phase 2**: SWA at constant lr (e.g. 100 epochs at 0.001), averaging weights
+
+```yaml
+trainer:
+  max_epochs: 400
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      dirpath: ${hydra:runtime.output_dir}
+      filename: best
+      save_last: true
+    - _target_: nequip_multihead.train.callbacks.StochasticWeightAveraging
+      swa_start_epoch: 300
+      swa_lr: 0.001
+
+training_module:
+  _target_: nequip.train.EMALightningModule
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.01
+  lr_scheduler:
+    scheduler:
+      _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+      T_max: 300
+      eta_min: 0.001    # match swa_lr for smooth transition
+    interval: epoch
+```
+
+At epoch 300, the callback:
+- Replaces the LR scheduler with a constant `swa_lr`
+- Takes the first weight snapshot
+- On each subsequent epoch, folds the new weights into a running average
+
+At training end, the SWA-averaged model is saved as **`swa_last.ckpt`** alongside the normal `last.ckpt`.
+
+### EMA + SWA
+
+SWA is compatible with `EMALightningModule`. They're complementary:
+
+- **EMA** smooths step-level noise (updates every optimizer step)
+- **SWA** averages epoch-level snapshots (updates every epoch during SWA phase)
+
+This is the same pattern MACE uses. After training you get two checkpoints:
+
+| Checkpoint | Contains |
+|------------|----------|
+| `last.ckpt` | EMA weights (smoothed training model) |
+| `swa_last.ckpt` | SWA-averaged weights (averaged over SWA phase) |
+
+### Deploying the SWA model
+
+Compile from `swa_last.ckpt` just like from `last.ckpt`:
+
+```bash
+# Single head
+nequip-compile swa_last.ckpt model_swa.nequip.pt2 \
+  --mode aotinductor --device cuda --target ase \
+  --modifiers extract_head head_name=baseline
+
+# Summed heads (delta-learning)
+nequip-compile swa_last.ckpt model_swa.nequip.pt2 \
+  --mode aotinductor --device cuda --target ase \
+  --modifiers extract_summed_heads head_names=baseline+delta
+```
+
+### Optional: MACE-style loss reweighting
+
+MACE bumps energy weight during Stage Two.  The `swa_loss_coeffs` parameter applies new loss coefficients when the SWA phase starts:
+
+```yaml
+    - _target_: nequip_multihead.train.callbacks.StochasticWeightAveraging
+      swa_start_epoch: 300
+      swa_lr: 0.001
+      swa_loss_coeffs:
+        per_atom_energy_mse: 1000.0
+        forces_mse: 100.0
+        stress_mse: 10.0
+```
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `swa_start_epoch` | *(required)* | Epoch to begin SWA (0-based) |
+| `swa_lr` | *(required)* | Constant LR during SWA phase |
+| `swa_loss_coeffs` | `null` | Optional loss coefficient overrides |
+| `annealing_epochs` | `1` | Epochs to anneal LR to `swa_lr` |
+| `save_snapshots` | `false` | Save per-epoch weight snapshots for debugging |
+
+## Dataloader shuffling
+
+```{warning}
+Always set `shuffle: true` in the dataloader config. PyTorch's `DataLoader` defaults to sequential ordering, which means every epoch sees frames in the same order. This biases SWA averages and can slow convergence in general.
+```
+
+```yaml
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: 5
+  shuffle: true
 ```

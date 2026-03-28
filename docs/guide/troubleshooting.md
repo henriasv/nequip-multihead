@@ -54,6 +54,14 @@ loss:
 atoms.cell = 100.0 * np.eye(3)  # dummy cell, pbc stays False
 ```
 
+## SWA checkpoint gives same result as last.ckpt
+
+**Problem**: Compiling from `swa_last.ckpt` gives the same model as `last.ckpt`.
+
+**Cause**: The SWA phase never started. Check that `swa_start_epoch < max_epochs` and that training reached `swa_start_epoch`.
+
+**Diagnosis**: Look for `SWA phase started` in the training log. If missing, the training ended before reaching `swa_start_epoch`.
+
 ## EMA checkpoint assertion error on best.ckpt
 
 **Problem**: `nequip-package` or `nequip-compile` on `best.ckpt` fails with "EMA module loaded in a state where it does not contain EMA weights."

@@ -17,6 +17,7 @@ chemical_species: ${model_type_names}
 dataloader:
   _target_: torch.utils.data.DataLoader
   batch_size: 5
+  shuffle: true
 
 data:
   _target_: nequip.data.datamodule.NequIPDataModule

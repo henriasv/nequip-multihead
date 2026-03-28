@@ -27,6 +27,7 @@ chemical_species: ${model_type_names}
 dataloader:
   _target_: torch.utils.data.DataLoader
   batch_size: 5
+  shuffle: true
   num_workers: 2
 
 data:

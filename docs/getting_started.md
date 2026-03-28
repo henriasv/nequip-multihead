@@ -48,6 +48,15 @@ model:
   # ... standard NequIP params (l_max, num_layers, etc.)
 ```
 
+**Dataloader** — always use `shuffle: true` so frames are reordered each epoch:
+
+```yaml
+dataloader:
+  _target_: torch.utils.data.DataLoader
+  batch_size: 5
+  shuffle: true
+```
+
 **Data** — `ConcatDataset` with `HeadStamper` labeling each dataset:
 
 ```yaml
