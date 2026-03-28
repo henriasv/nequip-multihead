@@ -65,11 +65,11 @@ class StochasticWeightAveraging(Callback):
     When EMA is active, SWA averages the *training* weights (not the EMA
     weights) at epoch boundaries — the same pattern MACE uses.
 
-    The SWA model is accessed at deployment time via::
+    The SWA model is saved as ``swa_last.ckpt`` alongside ``last.ckpt``.
+    Deploy it via::
 
-        nequip-compile last.ckpt model.pt2 --mode aotinductor \\
-            --device cuda --target ase \\
-            --modifiers load_swa_weights
+        nequip-compile swa_last.ckpt model_swa.pt2 --mode aotinductor \\
+            --device cuda --target ase
 
     Args:
         swa_start_epoch: Epoch at which SWA begins (0-based).
@@ -205,7 +205,7 @@ class StochasticWeightAveraging(Callback):
             f"to {swa_path}"
         )
 
-        # Temporarily swap SWA weights into the model
+        # Temporarily swap SWA weights into the model for checkpoint save.
         original_params = [
             p.detach().clone() for p in pl_module.model.parameters()
         ]
@@ -215,6 +215,22 @@ class StochasticWeightAveraging(Callback):
             ):
                 model_p.copy_(avg_p.to(model_p.device))
 
+        # If EMA is active, also copy SWA weights into EMA buffers.
+        # Without this, nequip-compile would swap the old EMA weights
+        # into the model (via evaluation_model), overwriting SWA weights.
+        original_ema = None
+        from nequip.train.ema import EMALightningModule
+
+        if isinstance(pl_module, EMALightningModule):
+            original_ema = [
+                w.detach().clone() for w in pl_module.ema.ema_weights
+            ]
+            with torch.no_grad():
+                for avg_p, ema_w in zip(
+                    self._averaged_params, pl_module.ema.ema_weights
+                ):
+                    ema_w.copy_(avg_p.to(ema_w.device))
+
         trainer.save_checkpoint(str(swa_path))
 
         # Restore original weights
@@ -223,6 +239,13 @@ class StochasticWeightAveraging(Callback):
                 original_params, pl_module.model.parameters()
             ):
                 model_p.copy_(orig_p)
+
+        if original_ema is not None:
+            with torch.no_grad():
+                for orig_w, ema_w in zip(
+                    original_ema, pl_module.ema.ema_weights
+                ):
+                    ema_w.copy_(orig_w)
 
         # Free memory
         self._averaged_params = None
