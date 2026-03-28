@@ -98,6 +98,7 @@ class StochasticWeightAveraging(Callback):
         swa_lr: float,
         swa_loss_coeffs: Optional[Dict[str, float]] = None,
         annealing_epochs: int = 1,
+        save_snapshots: bool = False,
     ):
         assert swa_start_epoch >= 1, "swa_start_epoch must be >= 1"
         assert swa_lr > 0, "swa_lr must be positive"
@@ -107,6 +108,7 @@ class StochasticWeightAveraging(Callback):
         self.swa_lr = swa_lr
         self.swa_loss_coeffs = swa_loss_coeffs
         self.annealing_epochs = annealing_epochs
+        self.save_snapshots = save_snapshots
 
         # Internal state (persisted via state_dict)
         self._swa_started: bool = False
@@ -154,6 +156,9 @@ class StochasticWeightAveraging(Callback):
             ]
             self._n_averaged = 1
 
+            if self.save_snapshots:
+                self._save_snapshot(trainer, pl_module, self._n_averaged)
+
             # Replace LR scheduler with SWALR
             optimizer = trainer.optimizers[0]
             swa_scheduler = SWALR(
@@ -186,6 +191,21 @@ class StochasticWeightAveraging(Callback):
                         (model_p.detach() - avg_p) / (self._n_averaged + 1)
                     )
             self._n_averaged += 1
+
+            if self.save_snapshots:
+                self._save_snapshot(trainer, pl_module, self._n_averaged)
+
+    def _save_snapshot(self, trainer, pl_module, snapshot_idx):
+        """Save a per-epoch weight snapshot for debugging/verification."""
+        import pathlib
+
+        base = _swa_checkpoint_path(trainer)
+        snap_dir = pathlib.Path(base).parent / "swa_snapshots"
+        snap_dir.mkdir(exist_ok=True)
+        snap_path = snap_dir / f"snapshot_{snapshot_idx:04d}.pt"
+        params = [p.detach().cpu() for p in pl_module.model.parameters()]
+        torch.save(params, str(snap_path))
+        logger.info(f"SWA: saved snapshot {snapshot_idx} to {snap_path}")
 
     def on_train_end(
         self,
