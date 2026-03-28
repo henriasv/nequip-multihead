@@ -4,6 +4,10 @@ Maintains an equal-weight running average of model parameters during the SWA
 phase, producing smoother energy surfaces and more robust models.  Inspired
 by MACE's "Stage Two" training.
 
+Compatible with ``EMALightningModule``: EMA smooths step-level noise while
+SWA averages epoch-level snapshots.  They operate on different timescales
+and are complementary (this is the same pattern MACE uses).
+
 Typical two-phase training schedule::
 
     Phase 1 (epochs 0–299): CosineAnnealingLR  lr 0.01 → 0.001
@@ -19,7 +23,7 @@ Example config::
           swa_lr: 0.001
 
     training_module:
-      _target_: nequip.train.NequIPLightningModule   # NOT EMALightningModule
+      _target_: nequip.train.EMALightningModule
       optimizer:
         _target_: torch.optim.Adam
         lr: 0.01
@@ -54,15 +58,18 @@ class StochasticWeightAveraging(Callback):
     3. Optionally overrides loss coefficients (MACE-style).
 
     Each subsequent epoch, the model weights are folded into an
-    equal-weight running average.  At the end of training, the averaged
-    weights are copied back into the model so that ``last.ckpt`` contains
-    the SWA model.
+    equal-weight running average.  When training ends, the SWA-averaged
+    weights are compiled into the model via ``nequip-compile``.
 
-    .. warning::
+    Works with both ``NequIPLightningModule`` and ``EMALightningModule``.
+    When EMA is active, SWA averages the *training* weights (not the EMA
+    weights) at epoch boundaries — the same pattern MACE uses.
 
-       Incompatible with ``EMALightningModule``.  Both mechanisms average
-       weights; using both produces undefined behavior.  Use
-       ``NequIPLightningModule`` instead.
+    The SWA model is accessed at deployment time via::
+
+        nequip-compile last.ckpt model.pt2 --mode aotinductor \\
+            --device cuda --target ase \\
+            --modifiers load_swa_weights
 
     Args:
         swa_start_epoch: Epoch at which SWA begins (0-based).
@@ -105,21 +112,12 @@ class StochasticWeightAveraging(Callback):
         self._swa_started: bool = False
         self._n_averaged: int = 0
         self._averaged_params: Optional[List[torch.Tensor]] = None
-        self._pre_swa_coeffs: Optional[Dict[str, float]] = None
 
     def on_fit_start(
         self,
         trainer: lightning.Trainer,
         pl_module: lightning.LightningModule,
     ):
-        from nequip.train.ema import EMALightningModule
-
-        if isinstance(pl_module, EMALightningModule):
-            raise RuntimeError(
-                "StochasticWeightAveraging is incompatible with "
-                "EMALightningModule — both perform weight averaging.  "
-                "Use NequIPLightningModule instead."
-            )
         if len(trainer.optimizers) != 1:
             raise RuntimeError(
                 "StochasticWeightAveraging requires exactly one optimizer."
@@ -196,17 +194,36 @@ class StochasticWeightAveraging(Callback):
     ):
         if self._averaged_params is None or self._n_averaged == 0:
             return
-        # Transfer averaged weights into the model so that last.ckpt
-        # (saved after on_train_end) contains the SWA model.
+
+        # Save a separate checkpoint with SWA weights swapped into the
+        # model, alongside the normal last.ckpt (which keeps training/EMA
+        # weights).  This mirrors MACE's approach of saving both
+        # model.pt and model_stagetwo.pt.
+        swa_path = _swa_checkpoint_path(trainer)
+        logger.info(
+            f"SWA: saving averaged weights ({self._n_averaged} snapshots) "
+            f"to {swa_path}"
+        )
+
+        # Temporarily swap SWA weights into the model
+        original_params = [
+            p.detach().clone() for p in pl_module.model.parameters()
+        ]
         with torch.no_grad():
             for avg_p, model_p in zip(
                 self._averaged_params, pl_module.model.parameters()
             ):
                 model_p.copy_(avg_p.to(model_p.device))
-        logger.info(
-            f"SWA: copied averaged weights ({self._n_averaged} snapshots) "
-            f"into model"
-        )
+
+        trainer.save_checkpoint(str(swa_path))
+
+        # Restore original weights
+        with torch.no_grad():
+            for orig_p, model_p in zip(
+                original_params, pl_module.model.parameters()
+            ):
+                model_p.copy_(orig_p)
+
         # Free memory
         self._averaged_params = None
 
@@ -229,3 +246,15 @@ class StochasticWeightAveraging(Callback):
         self._swa_started = state_dict["swa_started"]
         self._n_averaged = state_dict["n_averaged"]
         self._averaged_params = state_dict.get("averaged_params")
+
+
+def _swa_checkpoint_path(trainer: lightning.Trainer) -> str:
+    """Derive the SWA checkpoint path from the trainer's output directory."""
+    import pathlib
+
+    # Use the same directory as last.ckpt
+    for cb in trainer.checkpoint_callbacks:
+        if hasattr(cb, "dirpath") and cb.dirpath:
+            return str(pathlib.Path(cb.dirpath) / "swa_last.ckpt")
+    # Fallback: trainer's default_root_dir
+    return str(pathlib.Path(trainer.default_root_dir) / "swa_last.ckpt")

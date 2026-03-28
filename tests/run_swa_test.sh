@@ -52,29 +52,56 @@ else
     exit 1
 fi
 
-if grep -q "SWA: copied averaged weights" "$WORK_DIR/train.log"; then
-    echo "  -> SWA weights transferred: OK"
+if grep -q "SWA: saving averaged weights" "$WORK_DIR/train.log"; then
+    echo "  -> SWA weights saved: OK"
 else
-    echo "  FAIL: SWA weights were not transferred"
+    echo "  FAIL: SWA weights were not saved"
     exit 1
 fi
 
 echo ""
-echo "--- Step 3: Verify checkpoint loads ---"
+echo "--- Step 2b: Verify SWA checkpoint exists ---"
+if [ -f "$WORK_DIR/swa_last.ckpt" ]; then
+    echo "  -> swa_last.ckpt exists: OK"
+else
+    echo "  FAIL: No swa_last.ckpt"
+    exit 1
+fi
+
+echo ""
+echo "--- Step 3: Verify checkpoints ---"
 python -c "
 import torch
+
 ckpt = torch.load('$WORK_DIR/last.ckpt', map_location='cpu', weights_only=False)
-print(f'  -> Epoch: {ckpt[\"epoch\"]}')
-print(f'  -> Global step: {ckpt[\"global_step\"]}')
+swa_ckpt = torch.load('$WORK_DIR/swa_last.ckpt', map_location='cpu', weights_only=False)
+
+print(f'  -> last.ckpt epoch: {ckpt[\"epoch\"]}')
+print(f'  -> swa_last.ckpt epoch: {swa_ckpt[\"epoch\"]}')
+
 # Check that callback state was persisted
 cb_states = ckpt.get('callbacks', {})
-swa_found = False
 for k, v in cb_states.items():
     if 'StochasticWeightAveraging' in k:
-        swa_found = True
         print(f'  -> SWA callback state: n_averaged={v[\"n_averaged\"]}, started={v[\"swa_started\"]}')
-if not swa_found:
-    print('  WARNING: SWA callback state not found in checkpoint')
+
+# Verify SWA and normal checkpoints have different weights
+diff = 0.0
+n = 0
+for key in ckpt['state_dict']:
+    if key not in swa_ckpt['state_dict']:
+        continue
+    a, b = ckpt['state_dict'][key], swa_ckpt['state_dict'][key]
+    if not isinstance(a, torch.Tensor) or a.numel() == 0:
+        continue
+    d = (a.float() - b.float()).abs().max().item()
+    if d > 0:
+        diff = max(diff, d)
+        n += 1
+print(f'  -> Parameters differing: {n}')
+print(f'  -> Max weight difference: {diff:.6f}')
+assert n > 0, 'SWA checkpoint should have different weights than last.ckpt'
+print('  -> PASS: SWA weights differ from training weights')
 "
 
 echo ""
