@@ -71,10 +71,9 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
             -1: nonlinearity_scalars["o"],
         }
 
-        # Output is scalar-only for each head (readout expects scalars)
-        # But each head may have a different number of scalar features
-        # depending on how many TP paths it uses.
-        # We'll compute per-head output irreps and set the "max" as module output.
+        # Output is even-parity scalar (0e) only for each head — this is what
+        # ScalarMLP readout expects. With parity=True the input may contain
+        # both 0e and 0o; we keep only 0e (physical scalars).
 
         self._init_irreps(
             irreps_in=irreps_in,
@@ -117,12 +116,14 @@ class PerHeadConvNetLayer(GraphModuleMixin, torch.nn.Module):
 
         # === Build full instruction set (max l_max across heads) ===
         max_l_max = max(per_head_l_max.values())
-        # Target: scalar-only output
+        # Target: even-parity scalar output only (0e).
+        # With parity=True, l=0 has both 0e and 0o; we keep only 0e
+        # to match ScalarMLP's assertion: len(irreps_in[field]) == 1.
         feature_irreps_out = Irreps(
             [
                 (mul, ir)
                 for mul, ir in feature_irreps_in
-                if ir.l == 0
+                if ir.l == 0 and ir.p == 1
             ]
         )
 
