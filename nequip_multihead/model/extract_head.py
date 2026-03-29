@@ -1,6 +1,7 @@
 """Utility to extract a single head (or sum of heads) from a trained multi-head model.
 
 Provides model modifiers for use with ``nequip-compile --modifiers``.
+Supports both node-based (NequIP) and edge-based (Allegro) multi-head readouts.
 """
 import copy
 
@@ -17,6 +18,18 @@ from nequip.nn.model_modifier_utils import model_modifier
 
 from nequip_multihead.nn.multihead_readout import MultiHeadReadout
 from nequip_multihead.nn.per_head_convnetlayer import PerHeadConvNetLayer
+
+try:
+    from nequip_multihead.nn.multihead_edge_readout import MultiHeadEdgeReadout
+
+    _HAS_EDGE_READOUT = True
+except ImportError:
+    _HAS_EDGE_READOUT = False
+
+# Tuple of classes to search for when finding multi-head readout modules
+_MULTIHEAD_READOUT_CLASSES = (MultiHeadReadout,)
+if _HAS_EDGE_READOUT:
+    _MULTIHEAD_READOUT_CLASSES = (MultiHeadReadout, MultiHeadEdgeReadout)
 
 
 def _is_instance_by_name(obj, cls):
@@ -103,52 +116,95 @@ class SingleHeadConv(GraphModuleMixin, torch.nn.Module):
         return data
 
 
+def _is_multihead_readout(obj):
+    """Check if obj is any multi-head readout type (node or edge based)."""
+    for cls in _MULTIHEAD_READOUT_CLASSES:
+        if _is_instance_by_name(obj, cls):
+            return True
+    return False
+
+
+def _is_edge_based_readout(obj):
+    """Check if obj is an edge-based multi-head readout (Allegro)."""
+    if not _HAS_EDGE_READOUT:
+        return False
+    return _is_instance_by_name(obj, MultiHeadEdgeReadout)
+
+
+def _find_multihead_readout(model):
+    """Walk the model tree to find any multi-head readout module.
+
+    Returns:
+        The multi-head readout module, or None if not found.
+    """
+    mhr = None
+
+    def _walk(module):
+        nonlocal mhr
+        if _is_multihead_readout(module):
+            mhr = module
+            return
+        for name, child in module.named_children():
+            _walk(child)
+
+    _walk(model)
+    return mhr
+
+
+def _find_seq_containing_readout(model):
+    """Find the SequentialGraphNetwork containing the multi-head readout.
+
+    Returns:
+        (seq_net, key_name) tuple, or None if not found.
+    """
+    def _walk(module):
+        if _is_instance_by_name(module, SequentialGraphNetwork):
+            for name, child in module.named_children():
+                if _is_multihead_readout(child):
+                    return module, name
+        for name, child in module.named_children():
+            result = _walk(child)
+            if result is not None:
+                return result
+        return None
+
+    return _walk(model)
+
+
+def _replace_seq_in_model(model, old_seq, new_seq):
+    """Replace a SequentialGraphNetwork in the model hierarchy."""
+    for name, child in model.named_children():
+        if child is old_seq:
+            setattr(model, name, new_seq)
+            return True
+        if _replace_seq_in_model(child, old_seq, new_seq):
+            return True
+    return False
+
+
 def extract_head(model: GraphModel, head_name: str) -> GraphModel:
     """Extract a single head from a multi-head model into a standalone single-head model.
 
     The returned model does not require ``HEAD_KEY`` in input data and produces
     identical outputs to the multi-head model for the specified head.
 
+    Supports both node-based (:class:`MultiHeadReadout`, NequIP) and
+    edge-based (:class:`MultiHeadEdgeReadout`, Allegro) readout modules.
+
     Args:
-        model: A :class:`~nequip.nn.GraphModel` containing a
-            :class:`~nequip.nn.MultiHeadReadout`.
-        head_name: Name of the head to extract (must be one of the
-            ``head_names`` used when building the multi-head model).
+        model: A :class:`~nequip.nn.GraphModel` containing a multi-head readout.
+        head_name: Name of the head to extract.
 
     Returns:
-        A new :class:`~nequip.nn.GraphModel` with the ``MultiHeadReadout``
-        replaced by the extracted head's ``ScalarMLP`` +
-        ``PerTypeScaleShift`` + ``AtomwiseReduce``.
-
-    Raises:
-        ValueError: If no ``MultiHeadReadout`` is found or ``head_name``
-            is not in the model.
+        A new :class:`~nequip.nn.GraphModel` with the multi-head readout
+        replaced by the extracted head's pipeline + ``AtomwiseReduce``.
     """
     model = copy.deepcopy(model)
 
-    # Find the SequentialGraphNetwork inside the model
-    # The structure is: GraphModel -> ForceStressOutput -> SequentialGraphNetwork
-    # or GraphModel -> SequentialGraphNetwork
-    seq_net = None
-    mhr = None
-    mhr_name = None
-
-    # Walk the model tree to find MultiHeadReadout
-    def _find_mhr(module, parent_name=""):
-        nonlocal seq_net, mhr, mhr_name
-        if _is_instance_by_name(module, MultiHeadReadout):
-            mhr = module
-            mhr_name = parent_name
-            return
-        for name, child in module.named_children():
-            full_name = f"{parent_name}.{name}" if parent_name else name
-            _find_mhr(child, full_name)
-
-    _find_mhr(model)
-
+    mhr = _find_multihead_readout(model)
     if mhr is None:
         raise ValueError(
-            "No MultiHeadReadout found in model. "
+            "No MultiHeadReadout or MultiHeadEdgeReadout found in model. "
             "Is this a multi-head model?"
         )
 
@@ -158,23 +214,10 @@ def extract_head(model: GraphModel, head_name: str) -> GraphModel:
             f"Available heads: {mhr.head_names}"
         )
 
-    # Find the SequentialGraphNetwork that contains the MultiHeadReadout
-    # Navigate to it by finding the parent
-    def _find_seq_and_replace(module):
-        if _is_instance_by_name(module, SequentialGraphNetwork):
-            for name, child in module.named_children():
-                if _is_instance_by_name(child, MultiHeadReadout):
-                    return module, name
-        for name, child in module.named_children():
-            result = _find_seq_and_replace(child)
-            if result is not None:
-                return result
-        return None
-
-    result = _find_seq_and_replace(model)
+    result = _find_seq_containing_readout(model)
     if result is None:
         raise ValueError(
-            "Could not find SequentialGraphNetwork containing MultiHeadReadout"
+            "Could not find SequentialGraphNetwork containing multi-head readout"
         )
     seq_net, multihead_key = result
 
@@ -182,6 +225,7 @@ def extract_head(model: GraphModel, head_name: str) -> GraphModel:
     head_modules = mhr.heads[head_name]
     readout = head_modules["readout"]
     scale_shift = head_modules["scale_shift"]
+    is_edge = _is_edge_based_readout(mhr)
 
     # Create AtomwiseReduce matching the original
     reduce = AtomwiseReduce(
@@ -200,7 +244,9 @@ def extract_head(model: GraphModel, head_name: str) -> GraphModel:
             new_modules["final_conv"] = SingleHeadConv(child, head_name)
         elif name == multihead_key:
             # Replace with individual head modules
-            new_modules["per_atom_energy_readout"] = readout
+            new_modules["edge_energy_readout" if is_edge else "per_atom_energy_readout"] = readout
+            if is_edge:
+                new_modules["edge_eng_sum"] = head_modules["edge_reduce"]
             new_modules["per_type_energy_scale_shift"] = scale_shift
             new_modules["total_energy_sum"] = reduce
         else:
@@ -209,18 +255,7 @@ def extract_head(model: GraphModel, head_name: str) -> GraphModel:
     # Build new SequentialGraphNetwork
     new_seq = SequentialGraphNetwork(new_modules)
 
-    # Replace in the model hierarchy
-    # Find where seq_net sits
-    def _replace_seq(parent, old_seq, new_seq):
-        for name, child in parent.named_children():
-            if child is old_seq:
-                setattr(parent, name, new_seq)
-                return True
-            if _replace_seq(child, old_seq, new_seq):
-                return True
-        return False
-
-    _replace_seq(model, seq_net, new_seq)
+    _replace_seq_in_model(model, seq_net, new_seq)
 
     # Update model's irreps
     model._init_irreps(
@@ -286,7 +321,7 @@ class SummedHeadsConvReadout(GraphModuleMixin, torch.nn.Module):
 class SummedHeadsReadout(GraphModuleMixin, torch.nn.Module):
     """Runs multiple heads' readout+scale_shift pipelines and sums per-atom energies.
 
-    Each head's pipeline (readout MLP → PerTypeScaleShift) is run independently,
+    Each head's pipeline (readout MLP -> PerTypeScaleShift) is run independently,
     producing a per-atom energy tensor. All per-atom energies are then summed
     element-wise. This enables deploying a single model that computes e.g.
     ``E_base + E_delta`` from a multi-head training run.
@@ -332,48 +367,80 @@ class SummedHeadsReadout(GraphModuleMixin, torch.nn.Module):
         return data
 
 
+class SummedHeadsEdgeReadout(GraphModuleMixin, torch.nn.Module):
+    """Runs multiple heads' edge readout pipelines and sums per-atom energies.
+
+    Each head's pipeline (readout MLP -> EdgewiseReduce -> PerTypeScaleShift)
+    is run independently. All per-atom energies are then summed element-wise.
+    This is the Allegro equivalent of :class:`SummedHeadsReadout`.
+
+    Args:
+        head_pipelines: list of ``(readout, edge_reduce, scale_shift)`` tuples.
+    """
+
+    def __init__(self, head_pipelines: list):
+        super().__init__()
+        self.head_readouts = torch.nn.ModuleList(
+            [r for r, _, _ in head_pipelines]
+        )
+        self.head_edge_reduces = torch.nn.ModuleList(
+            [e for _, e, _ in head_pipelines]
+        )
+        self.head_scale_shifts = torch.nn.ModuleList(
+            [s for _, _, s in head_pipelines]
+        )
+        first_readout = head_pipelines[0][0]
+        last_scale_shift = head_pipelines[0][2]
+        self._init_irreps(
+            irreps_in=first_readout.irreps_in,
+            irreps_out=last_scale_shift.irreps_out,
+        )
+
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+        total = None
+        for readout, edge_reduce, scale_shift in zip(
+            self.head_readouts, self.head_edge_reduces, self.head_scale_shifts
+        ):
+            # data.copy() is critical because EdgewiseReduce writes to
+            # NODE_FEATURES_KEY as a side effect.
+            head_data = {k: v for k, v in data.items()}
+            head_data = readout(head_data)
+            head_data = edge_reduce(head_data)
+            head_data = scale_shift(head_data)
+            e = head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY]
+            total = e if total is None else total + e
+
+        data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = total
+        return data
+
+
 def extract_summed_heads(model: GraphModel, head_names: list) -> GraphModel:
     """Extract multiple heads from a multi-head model and sum their outputs.
 
-    The returned model runs each requested head's readout + scale_shift pipeline
-    and sums the resulting per-atom energies. This is useful for delta-learning
+    The returned model runs each requested head's readout pipeline and sums
+    the resulting per-atom energies. This is useful for delta-learning
     workflows where the deployed prediction is e.g.
     ``E_base + E_delta = E_target``.
+
+    Supports both node-based (:class:`MultiHeadReadout`, NequIP) and
+    edge-based (:class:`MultiHeadEdgeReadout`, Allegro) readout modules.
 
     The returned model does not require ``HEAD_KEY`` in input data.
 
     Args:
-        model: A :class:`~nequip.nn.GraphModel` containing a
-            :class:`~nequip.nn.MultiHeadReadout`.
+        model: A :class:`~nequip.nn.GraphModel` containing a multi-head readout.
         head_names: List of head names to sum (must all be present in the model).
 
     Returns:
-        A new :class:`~nequip.nn.GraphModel` with the ``MultiHeadReadout``
-        replaced by a :class:`SummedHeadsReadout` + ``AtomwiseReduce``.
-
-    Raises:
-        ValueError: If no ``MultiHeadReadout`` is found, or any head name
-            is not in the model.
+        A new :class:`~nequip.nn.GraphModel` with the multi-head readout
+        replaced by a summed readout + ``AtomwiseReduce``.
     """
     model = copy.deepcopy(model)
 
-    # Find MultiHeadReadout
-    mhr = None
-
-    def _find_mhr(module, parent_name=""):
-        nonlocal mhr
-        if _is_instance_by_name(module, MultiHeadReadout):
-            mhr = module
-            return
-        for name, child in module.named_children():
-            full_name = f"{parent_name}.{name}" if parent_name else name
-            _find_mhr(child, full_name)
-
-    _find_mhr(model)
-
+    mhr = _find_multihead_readout(model)
     if mhr is None:
         raise ValueError(
-            "No MultiHeadReadout found in model. "
+            "No MultiHeadReadout or MultiHeadEdgeReadout found in model. "
             "Is this a multi-head model?"
         )
 
@@ -384,64 +451,61 @@ def extract_summed_heads(model: GraphModel, head_names: list) -> GraphModel:
                 f"Available heads: {mhr.head_names}"
             )
 
-    # Find the SequentialGraphNetwork containing the MultiHeadReadout
-    def _find_seq_and_replace(module):
-        if _is_instance_by_name(module, SequentialGraphNetwork):
-            for name, child in module.named_children():
-                if _is_instance_by_name(child, MultiHeadReadout):
-                    return module, name
-        for name, child in module.named_children():
-            result = _find_seq_and_replace(child)
-            if result is not None:
-                return result
-        return None
-
-    result = _find_seq_and_replace(model)
+    result = _find_seq_containing_readout(model)
     if result is None:
         raise ValueError(
-            "Could not find SequentialGraphNetwork containing MultiHeadReadout"
+            "Could not find SequentialGraphNetwork containing multi-head readout"
         )
     seq_net, multihead_key = result
 
-    # Build per-head (readout, scale_shift) pipelines
-    head_pipelines = []
-    for hn in head_names:
-        head_modules = mhr.heads[hn]
-        readout = head_modules["readout"]
-        scale_shift = head_modules["scale_shift"]
-        head_pipelines.append((readout, scale_shift))
+    is_edge = _is_edge_based_readout(mhr)
 
-    summed = SummedHeadsReadout(head_pipelines)
+    # Build per-head pipelines and summed readout
+    if is_edge:
+        head_pipelines = []
+        for hn in head_names:
+            hm = mhr.heads[hn]
+            head_pipelines.append((hm["readout"], hm["edge_reduce"], hm["scale_shift"]))
+        summed = SummedHeadsEdgeReadout(head_pipelines)
+        reduce_irreps_in = head_pipelines[0][2].irreps_out
+    else:
+        head_pipelines_2 = []
+        for hn in head_names:
+            hm = mhr.heads[hn]
+            head_pipelines_2.append((hm["readout"], hm["scale_shift"]))
+        summed = SummedHeadsReadout(head_pipelines_2)
+        reduce_irreps_in = head_pipelines_2[0][1].irreps_out
 
     # Create AtomwiseReduce
     reduce = AtomwiseReduce(
-        irreps_in=head_pipelines[0][1].irreps_out,
+        irreps_in=reduce_irreps_in,
         reduce="sum",
         field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
         out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
     )
 
-    # Check for PerHeadConvNetLayer — needs special handling
+    # Check for PerHeadConvNetLayer (NequIP only) — needs special handling
     per_head_conv = None
     per_head_conv_key = None
-    for name, child in seq_net.named_children():
-        if _is_instance_by_name(child, PerHeadConvNetLayer):
-            per_head_conv = child
-            per_head_conv_key = name
-            break
+    if not is_edge:
+        for name, child in seq_net.named_children():
+            if _is_instance_by_name(child, PerHeadConvNetLayer):
+                per_head_conv = child
+                per_head_conv_key = name
+                break
 
-    # Replace MultiHeadReadout (and PerHeadConvNetLayer if present)
+    # Replace multi-head readout (and PerHeadConvNetLayer if present)
     new_modules = {}
     if per_head_conv is not None:
         # Build combined conv+readout pipeline per head, then sum
-        head_pipelines = []
+        conv_pipelines = []
         for hn in head_names:
             conv = SingleHeadConv(per_head_conv, hn)
             readout = mhr.heads[hn]["readout"]
             scale_shift = mhr.heads[hn]["scale_shift"]
-            head_pipelines.append((conv, readout, scale_shift))
+            conv_pipelines.append((conv, readout, scale_shift))
 
-        summed_conv_readout = SummedHeadsConvReadout(head_pipelines)
+        summed_conv_readout = SummedHeadsConvReadout(conv_pipelines)
 
         for name, child in seq_net.named_children():
             if name == per_head_conv_key:
@@ -461,17 +525,7 @@ def extract_summed_heads(model: GraphModel, head_names: list) -> GraphModel:
 
     new_seq = SequentialGraphNetwork(new_modules)
 
-    # Replace in the model hierarchy
-    def _replace_seq(parent, old_seq, new_seq):
-        for name, child in parent.named_children():
-            if child is old_seq:
-                setattr(parent, name, new_seq)
-                return True
-            if _replace_seq(child, old_seq, new_seq):
-                return True
-        return False
-
-    _replace_seq(model, seq_net, new_seq)
+    _replace_seq_in_model(model, seq_net, new_seq)
 
     model._init_irreps(
         irreps_in=model.irreps_in,

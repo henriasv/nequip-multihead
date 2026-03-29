@@ -1,0 +1,212 @@
+# Multi-head edge readout module for Allegro models
+import torch
+
+from nequip.data import AtomicDataDict
+from nequip.nn._graph_mixin import GraphModuleMixin
+from nequip.nn.model_modifier_utils import model_modifier
+from nequip.nn.atomwise import AtomwiseReduce, PerTypeScaleShift
+from nequip.nn.mlp import ScalarMLP
+
+from allegro.nn import EdgewiseReduce
+
+from nequip_multihead._keys import HEAD_KEY
+
+from typing import Dict, List, Optional, Union, Sequence
+
+
+class MultiHeadEdgeReadout(GraphModuleMixin, torch.nn.Module):
+    """Multi-head readout that branches into per-head edge readout pathways
+    and selects outputs based on ``HEAD_KEY``.
+
+    Each head has its own ``ScalarMLP`` (edge readout), ``EdgewiseReduce``
+    (edge-to-node reduction), and ``PerTypeScaleShift`` (per-type scales/shifts).
+    All heads produce per-atom energies, which are then selected per-atom based
+    on the head index. A shared ``AtomwiseReduce`` sums the selected per-atom
+    energies to total energy.
+
+    This is the Allegro equivalent of :class:`MultiHeadReadout`, which operates
+    on node features. Here we operate on edge features instead.
+
+    If ``HEAD_KEY`` is absent from the data, head 0 is used (backward compat).
+
+    Args:
+        head_names: list of head name strings (e.g. ``["baseline", "delta"]``)
+        type_names: list of atom type names
+        readout_mlp_hidden_layers_depth: depth of hidden layers in readout MLP
+        readout_mlp_hidden_layers_width: width of hidden layers in readout MLP
+        readout_mlp_nonlinearity: nonlinearity for readout MLP
+        per_head_energy_scales: dict mapping head_name to scales
+        per_head_energy_shifts: dict mapping head_name to shifts
+        per_type_energy_scales_trainable: whether scales are trainable
+        per_type_energy_shifts_trainable: whether shifts are trainable
+        avg_num_neighbors: used to normalize EdgewiseReduce
+        forward_normalize: whether to use forward weight init in ScalarMLP
+        irreps_in: input irreps dict
+    """
+
+    def __init__(
+        self,
+        head_names: List[str],
+        type_names: Sequence[str],
+        readout_mlp_hidden_layers_depth: int = 1,
+        readout_mlp_hidden_layers_width: int = 32,
+        readout_mlp_nonlinearity: Optional[str] = "silu",
+        per_head_energy_scales: Optional[
+            Dict[str, Optional[Union[float, Dict[str, float]]]]
+        ] = None,
+        per_head_energy_shifts: Optional[
+            Dict[str, Optional[Union[float, Dict[str, float]]]]
+        ] = None,
+        per_type_energy_scales_trainable: bool = False,
+        per_type_energy_shifts_trainable: bool = False,
+        avg_num_neighbors: Union[float, Dict[str, float]] = None,
+        forward_normalize: bool = True,
+        irreps_in=None,
+    ):
+        super().__init__()
+        assert len(head_names) >= 1, "At least one head must be provided"
+        self.head_names = head_names
+        self.num_heads = len(head_names)
+
+        if per_head_energy_scales is None:
+            per_head_energy_scales = {}
+        if per_head_energy_shifts is None:
+            per_head_energy_shifts = {}
+
+        # Build per-head readout + edge_reduce + scale/shift modules
+        heads = {}
+        for head_name in head_names:
+            readout = ScalarMLP(
+                output_dim=1,
+                hidden_layers_depth=readout_mlp_hidden_layers_depth,
+                hidden_layers_width=readout_mlp_hidden_layers_width,
+                nonlinearity=readout_mlp_nonlinearity,
+                bias=False,
+                forward_weight_init=forward_normalize,
+                field=AtomicDataDict.EDGE_FEATURES_KEY,
+                out_field=AtomicDataDict.EDGE_ENERGY_KEY,
+                irreps_in=irreps_in,
+            )
+            edge_reduce = EdgewiseReduce(
+                field=AtomicDataDict.EDGE_ENERGY_KEY,
+                out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+                avg_num_neighbors=avg_num_neighbors,
+                type_names=type_names,
+                irreps_in=readout.irreps_out,
+            )
+            scale_shift = PerTypeScaleShift(
+                type_names=type_names,
+                field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+                out_field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+                scales=per_head_energy_scales.get(head_name, None),
+                shifts=per_head_energy_shifts.get(head_name, None),
+                scales_trainable=per_type_energy_scales_trainable,
+                shifts_trainable=per_type_energy_shifts_trainable,
+                irreps_in=edge_reduce.irreps_out,
+            )
+            heads[head_name] = torch.nn.ModuleDict(
+                {
+                    "readout": readout,
+                    "edge_reduce": edge_reduce,
+                    "scale_shift": scale_shift,
+                }
+            )
+
+        self.heads = torch.nn.ModuleDict(heads)
+
+        # Shared reduce
+        any_head = heads[head_names[0]]
+        self.reduce = AtomwiseReduce(
+            irreps_in=any_head["scale_shift"].irreps_out,
+            reduce="sum",
+            field=AtomicDataDict.PER_ATOM_ENERGY_KEY,
+            out_field=AtomicDataDict.TOTAL_ENERGY_KEY,
+        )
+
+        # Set up irreps — include HEAD_KEY so GraphModel passes it through
+        if irreps_in is not None:
+            irreps_in = dict(irreps_in)
+        else:
+            irreps_in = {}
+        irreps_in[HEAD_KEY] = None  # non-tensor irreps (integer field)
+        self._init_irreps(
+            irreps_in=irreps_in,
+            irreps_out=self.reduce.irreps_out,
+        )
+
+    def forward(self, data: AtomicDataDict.Type) -> AtomicDataDict.Type:
+        # Get head indices per frame
+        if HEAD_KEY in data:
+            frame_heads = data[HEAD_KEY].view(-1)
+        else:
+            # Default to head 0 if no HEAD_KEY (backward compat / inference)
+            n_frames = AtomicDataDict.num_frames(data)
+            frame_heads = torch.zeros(
+                n_frames,
+                dtype=torch.long,
+                device=data[AtomicDataDict.POSITIONS_KEY].device,
+            )
+
+        # Broadcast to per-atom head indices
+        if AtomicDataDict.BATCH_KEY in data:
+            node_heads = frame_heads[data[AtomicDataDict.BATCH_KEY]]
+        else:
+            n_atoms = AtomicDataDict.num_nodes(data)
+            node_heads = frame_heads[0].expand(n_atoms)
+
+        # Run each head and collect per-atom energies.
+        # data.copy() is critical because EdgewiseReduce writes to
+        # NODE_FEATURES_KEY as a side effect.
+        head_outputs = []
+        for head_name in self.head_names:
+            head_modules = self.heads[head_name]
+            head_data = data.copy()
+            head_data = head_modules["readout"](head_data)
+            head_data = head_modules["edge_reduce"](head_data)
+            head_data = head_modules["scale_shift"](head_data)
+            head_outputs.append(head_data[AtomicDataDict.PER_ATOM_ENERGY_KEY])
+
+        # Stack and select: [n_atoms, n_heads, 1]
+        stacked = torch.stack(head_outputs, dim=1)
+        arange = torch.arange(stacked.shape[0], device=stacked.device)
+        selected = stacked[arange, node_heads, :]
+
+        data[AtomicDataDict.PER_ATOM_ENERGY_KEY] = selected
+
+        # Reduce to total energy (for the selected head)
+        data = self.reduce(data)
+
+        return data
+
+    @model_modifier(persistent=True, private=False)
+    @classmethod
+    def extract_head(cls, model, head_name: str):
+        """Extract a single head from a multi-head model for deployment.
+
+        Use via ``nequip-compile --modifiers extract_head head_name=dft``.
+        The returned model is a standard single-head model that does not
+        require HEAD_KEY in input data.
+        """
+        from nequip_multihead.model.extract_head import extract_head
+
+        return extract_head(model, head_name)
+
+    @model_modifier(persistent=True, private=False)
+    @classmethod
+    def extract_summed_heads(cls, model, head_names: str):
+        """Extract and sum multiple heads for delta-learning deployment.
+
+        Use via ``nequip-compile --modifiers extract_summed_heads head_names=dft+rpa``
+        or ``head_names=dft,rpa``. Both ``+`` and ``,`` are accepted as separators.
+
+        The compiled model sums the per-atom energies from all specified heads.
+        Forces and stress are computed from the summed energy via autograd.
+        """
+        from nequip_multihead.model.extract_head import extract_summed_heads
+
+        # Support both + and , as separators
+        if "+" in head_names:
+            names = head_names.split("+")
+        else:
+            names = head_names.split(",")
+        return extract_summed_heads(model, names)
