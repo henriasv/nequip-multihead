@@ -4,9 +4,21 @@ import logging
 import lightning
 import torch
 
-from nequip.nn import ConvNetLayer, SequentialGraphNetwork, ForceStressOutput
+from nequip.nn import ConvNetLayer, SequentialGraphNetwork
 
 logger = logging.getLogger(__name__)
+
+
+def _is_instance_by_name(obj, cls):
+    """Check isinstance, falling back to class name for torch.package compatibility.
+
+    When models are loaded from .nequip.zip packages via torch.package, classes
+    may exist in a different namespace. The standard isinstance check fails, but
+    the class name still matches.
+    """
+    if isinstance(obj, cls):
+        return True
+    return type(obj).__name__ == cls.__name__
 
 
 class FreezeLayersCallback(lightning.Callback):
@@ -52,7 +64,7 @@ class FreezeLayersCallback(lightning.Callback):
         conv_indices = []
         children_list = list(seq_net.named_children())
         for i, (name, child) in enumerate(children_list):
-            if isinstance(child, ConvNetLayer):
+            if _is_instance_by_name(child, ConvNetLayer):
                 conv_indices.append(i)
 
         total_conv = len(conv_indices)
@@ -107,8 +119,11 @@ class FreezeLayersCallback(lightning.Callback):
             logger.info(line)
 
     def _find_sequential(self, module):
-        """Find SequentialGraphNetwork by walking the module tree."""
-        if isinstance(module, SequentialGraphNetwork):
+        """Find SequentialGraphNetwork by walking the module tree.
+
+        Uses name-based matching as fallback for torch.package compatibility.
+        """
+        if _is_instance_by_name(module, SequentialGraphNetwork):
             return module
         for child in module.children():
             result = self._find_sequential(child)
